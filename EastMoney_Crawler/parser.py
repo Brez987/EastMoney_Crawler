@@ -191,7 +191,7 @@ class PostParser(object):
                 'Accept': 'text/html,application/xhtml+xml',
                 'Accept-Language': 'zh-CN,zh;q=0.9',
             }
-            resp = requests.get(post_url, headers=headers, timeout=8)
+            resp = requests.get(post_url, headers=headers, timeout=(3, 5))
             if resp.status_code != 200:
                 return result
 

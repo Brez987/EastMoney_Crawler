@@ -349,21 +349,21 @@ class PostCrawler(object):
 
     def crawl_post_detail(self, limit: int = None, url_type: str = 'all',
                           posts: list = None, update_callback=None,
-                          parallel: bool = False, max_workers: int = 2):
+                          max_workers: int = 3):
         """爬取帖子详情页的完整正文内容（混合策略版）
 
         策略：
         - 财富号帖子：多线程 requests（无浏览器，不触发验证页）
-        - 非财富号帖子：单线程 Selenium + 自适应延迟
+        - 非财富号帖子：多 worker 并发（每 worker 独立浏览器 + JS fetch）
 
         Args:
             limit: 限制爬取的帖子数量，None 表示爬取所有帖子
             url_type: 筛选帖子类型
             posts: 外部传入的帖子列表
-            update_callback: 外部更新回调
-            parallel: 是否启用多线程并行爬取（仅对财富号生效）
-            max_workers: 并行线程数，默认 2
+            update_callback: 外部更新回调（线程安全）
+            max_workers: 并发 worker 数，默认 3。值为 1 时回退单线程模式
         """
+        worker_count = max(1, max_workers)
         use_external = posts is not None
         if use_external:
             all_posts = posts
@@ -394,20 +394,30 @@ class PostCrawler(object):
 
         print(f'{self.symbol}: 共 {total} 条帖子待爬取')
         print(f'  - 财富号: {len(caifuhao_posts)} 条（多线程 requests）')
-        print(f'  - 股吧原生: {len(guba_posts)} 条（单线程 Selenium）')
+        if worker_count > 1:
+            print(f'  - 股吧原生: {len(guba_posts)} 条（{worker_count} worker 并发）')
+        else:
+            print(f'  - 股吧原生: {len(guba_posts)} 条（单线程 Selenium）')
 
         # 先爬财富号帖子（多线程 requests）
         if caifuhao_posts:
-            self._crawl_caifuhao_posts(caifuhao_posts, update_callback, max_workers)
+            self._crawl_caifuhao_posts(caifuhao_posts, update_callback, max_workers=min(worker_count * 2, 8))
 
-        # 再爬非财富号帖子（单线程 Selenium + 自适应延迟）
+        # 爬非财富号帖子
         if guba_posts:
-            self._crawl_guba_posts(guba_posts, update_callback)
+            if worker_count > 1:
+                self._crawl_guba_posts_parallel(guba_posts, update_callback, num_workers=worker_count)
+            else:
+                self._crawl_guba_posts(guba_posts, update_callback)
 
         print(f'{self.symbol}: 正文爬取完成，共处理 {total} 条帖子')
 
     def _crawl_caifuhao_posts(self, posts: list, update_callback, max_workers: int = 2):
-        """多线程爬取财富号帖子（使用 requests，无浏览器）"""
+        """多线程爬取财富号帖子（仅使用 requests，无浏览器兜底）
+
+        财富号历史文章可能已删除/失效。此处不能调用 parse_post_detail()，
+        因为它在 requests 为空时会回退 Selenium，失效文章多时会导致 Stage 2 长时间卡住。
+        """
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         total = len(posts)
@@ -424,7 +434,7 @@ class PostCrawler(object):
             post_url = post['post_url']
 
             try:
-                detail = parser.parse_post_detail(post_url)
+                detail = parser._try_requests_caifuhao(post_url)
 
                 if detail['post_content']:
                     update_data = {'post_content': detail['post_content']}
@@ -445,15 +455,33 @@ class PostCrawler(object):
                             print(f'{self.symbol}: 财富号已爬取 {success_count}/{total} 条')
                     return True
                 else:
-                    # 正文为空 → 标记为已处理（断点续爬友好）
+                    # 正文为空/文章失效 → 持久记录为失败，后续重跑直接跳过。
                     with lock:
                         if update_callback:
-                            update_callback(post_id, {'post_content': ''})
+                            update_callback(
+                                post_id,
+                                {
+                                    'post_content': '',
+                                    '_detail_failed': True,
+                                    'reason': 'caifuhao_empty_or_invalid',
+                                    'post_url': post_url,
+                                }
+                            )
                         error_count += 1
                     return False
 
             except Exception as e:
                 with lock:
+                    if update_callback:
+                        update_callback(
+                            post_id,
+                            {
+                                'post_content': '',
+                                '_detail_failed': True,
+                                'reason': f'caifuhao_exception:{type(e).__name__}',
+                                'post_url': post_url,
+                            }
+                        )
                     error_count += 1
                 return False
 
@@ -461,6 +489,9 @@ class PostCrawler(object):
             futures = [executor.submit(crawl_one, post) for post in posts]
             for future in as_completed(futures):
                 future.result()  # 等待所有任务完成
+                processed = success_count + error_count
+                if processed % 20 == 0 or processed == total:
+                    print(f'{self.symbol}: 财富号进度 {processed}/{total}，成功 {success_count}，失效/失败 {error_count}')
 
         print(f'{self.symbol}: 财富号爬取完成，成功 {success_count}，失败 {error_count}')
 
@@ -556,29 +587,50 @@ class PostCrawler(object):
         parser.close()
         print(f'{self.symbol}: 股吧原生帖子爬取完成，共 {total} 条（成功 {total - empty_count}，为空 {empty_count}）')
 
-    def _crawl_post_detail_parallel(self, posts_to_crawl: list,
-                                     update_callback, max_workers: int = 2):
-        """多线程并行爬取帖子正文（方向3优化）
+    def _crawl_guba_posts_parallel(self, posts: list, update_callback, num_workers: int = 3):
+        """多 worker 并发爬取股吧原生帖子（保守策略）
 
-        每线程独立 PostParser + 浏览器实例，update_callback 加锁保护。
+        每个 worker 独立创建 PostParser + 浏览器实例。
+        每个 worker 启动后先访问一次列表页建立 cookies。
+        正文获取优先使用 JS fetch，保留重启/空正文/异常冷却逻辑。
         """
-        total = len(posts_to_crawl)
-        chunks = [posts_to_crawl[i::max_workers] for i in range(max_workers)]
-        result_lock = threading.Lock()
-        progress = {'done': 0, 'total': total}
+        total = len(posts)
+        num_workers = max(1, min(num_workers, 8))  # 限制 1~8
+        print(f'{self.symbol}: 启动 {num_workers} 个 worker 并发爬取 {total} 条股吧原生帖子...')
 
-        def worker(thread_id, chunk):
+        # 均匀分片
+        chunks = [posts[i::num_workers] for i in range(num_workers)]
+        # 过滤空分片
+        chunks = [c for c in chunks if c]
+        num_workers = len(chunks)
+        print(f'{self.symbol}: 实际 {num_workers} 个 worker，每 worker {len(chunks[0])}~{len(chunks[-1])} 条')
+
+        progress_lock = threading.Lock()
+        progress = {'done': 0, 'empty': 0, 'errors': 0}
+
+        def worker(thread_id: int, chunk: list):
             parser = PostParser()
+            RESTART_INTERVAL = 20
             consecutive_errors = 0
-            RESTART_INTERVAL = 15
+            adaptive_delay = 0.0
+            empty_count = 0
+
+            # 建立 cookies：先访问一次列表页
+            try:
+                driver = parser.get_detail_browser()
+                driver.get(f'https://guba.eastmoney.com/list,{self.symbol},f_1.html')
+                time.sleep(1.5)
+            except Exception as e:
+                print(f'{self.symbol}: worker-{thread_id} 初始化失败: {e}')
+                parser.close()
+                return
 
             for i, post in enumerate(chunk):
                 post_id = post['_id']
                 post_url = post['post_url']
 
                 try:
-                    # 方向1：降低延迟
-                    time.sleep(abs(random.normalvariate(0.2, 0.05)))
+                    time.sleep(adaptive_delay + random.uniform(0, 0.1))
 
                     detail = parser.parse_post_detail(post_url)
 
@@ -593,47 +645,66 @@ class PostCrawler(object):
                         if detail.get('post_author'):
                             update_data['post_author'] = detail['post_author']
 
-                        with result_lock:
-                            if update_callback:
-                                update_callback(post_id, update_data)
-                            progress['done'] += 1
-                        consecutive_errors = 0
-                    else:
-                        with result_lock:
-                            progress['done'] += 1
-                        consecutive_errors += 1
+                        if update_callback:
+                            update_callback(post_id, update_data)
 
-                except Exception:
-                    with result_lock:
+                        consecutive_errors = 0
+                        adaptive_delay = max(0.2, adaptive_delay * 0.85)
+                    else:
+                        empty_count += 1
+                        if update_callback:
+                            update_callback(post_id, {'post_content': ''})
+
+                    with progress_lock:
                         progress['done'] += 1
+                        if progress['done'] % 10 == 0 or progress['done'] == total:
+                            pct = progress['done'] * 100 / total
+                            print(f'{self.symbol}: 股吧 {progress["done"]}/{total} ({pct:.1f}%) '
+                                  f'[worker-{thread_id}] 成功, 空{progress["empty"]}, 延迟{adaptive_delay:.1f}s')
+
+                except Exception as e:
                     consecutive_errors += 1
+                    adaptive_delay = min(3.0, adaptive_delay * 1.5)
+                    with progress_lock:
+                        progress['done'] += 1
+                        progress['errors'] += 1
+                    if progress['errors'] <= 5:
+                        print(f'{self.symbol}: worker-{thread_id} 帖子 {post_id} 出错: {e}')
                     continue
 
-                # 方向2：每15条重启
+                # 每 20 条重启浏览器
                 if (i + 1) % RESTART_INTERVAL == 0:
-                    parser.restart_detail_browser()
-                    time.sleep(1)
+                    try:
+                        parser.restart_detail_browser()
+                        time.sleep(1)
+                    except Exception as e:
+                        print(f'{self.symbol}: worker-{thread_id} 浏览器重启失败: {e}')
+                        consecutive_errors += 1
+                        time.sleep(2)
 
-                if consecutive_errors >= 3:
-                    parser.restart_detail_browser()
-                    time.sleep(3)
-                    consecutive_errors = 0
-
-                # 方向5：每10条打印进度
-                if progress['done'] % 10 == 0 or progress['done'] == total:
-                    print(f'{self.symbol}: 已爬取 {progress["done"]}/{total} 条帖子正文，进度 {progress["done"]*100/total:.1f}%')
+                # 连续 5 次异常冷却
+                if consecutive_errors >= 5:
+                    print(f'{self.symbol}: worker-{thread_id} 连续 {consecutive_errors} 次异常，重启冷却...')
+                    try:
+                        parser.restart_detail_browser()
+                        time.sleep(3)
+                        consecutive_errors = 0
+                        adaptive_delay = 1.5
+                    except Exception as e:
+                        print(f'{self.symbol}: worker-{thread_id} 重启失败: {e}')
+                        time.sleep(5)
 
             parser.close()
 
-        print(f'{self.symbol}: 启用多线程并行爬取，{max_workers} 个 worker...')
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = []
-            for tid, chunk in enumerate(chunks):
-                futures.append(executor.submit(worker, tid, chunk))
+            for tid in range(num_workers):
+                futures.append(executor.submit(worker, tid, chunks[tid]))
             for f in as_completed(futures):
                 f.result()
 
-        print(f'{self.symbol}: 正文爬取完成，共处理 {total} 条帖子（并行模式）')
+        print(f'{self.symbol}: 股吧原生帖子 {num_workers} worker 并发完成，'
+              f'共 {total} 条（成功 {total - progress["empty"]}，空 {progress["empty"]}，错误 {progress["errors"]}）')
 
 
 class CommentCrawler(object):

@@ -22,6 +22,10 @@ temp_export/
 .idea/
 .vscode/
 
+# 批量 Worker 运行时状态
+batch_progress/
+batch_logs/
+
 # 日志和临时文件
 *.log
 *.tmp

@@ -1,173 +1,328 @@
-# 000001 自动化流水线速度优化方案与实施记录
+# 2000 支股票批量跑数作战手册
 
-更新时间：2026-06-17
+## 目标与当前基线
 
-目标：在保持现有 CSV 字段兼容的前提下，显著缩短 `README.md` 第 2.4 节所述 CSV-Native 流水线的爬取耗时，为后续 4000+ 股票代码批量爬取做准备。
+目标：在 30 天内跑完约 **2000 支股票** 的 `Stage 1 → Stage 2 → Stage 3` 流水线。
+
+最低吞吐要求：
+
+- 2000 支 / 30 天 ≈ **67 支/天**
+- 推荐目标：**80 支/天以上**，给失败重试、网络波动和人工检查留余量
+
+当前代码事实：
+
+- `auto_pipeline_000001.py` 已支持 `--stock`，无需改源码切股票。
+- `auto_pipeline_000001.py` 已支持 `--detail-workers`，默认 `3`。
+- Stage 2 已不爬评论，不要求 MongoDB。
+- 普通股吧帖正文默认用 `post_title` 填充，不再打开详情页。
+- 财富号正文走多线程 `requests`。
+- 财富号正文失效/空正文会写入 `{stock}_detail_failed.jsonl`，后续重跑会跳过。
+- Stage 3 当前默认 `SKIP_BAIDU_UPLOAD=True`，产物复制到 `data/{stock}_enhanced.csv`。
+
+默认批量运行档位：
+
+| 档位 | batch worker | 每个 worker 的 `--detail-workers` | 适用场景 |
+|------|--------------|-----------------------------------|----------|
+| 保守档 | 2 | 2 | 8GB 内存或需要先验证稳定性 |
+| 推荐档 | 3 | 3 | 默认全量跑数档位 |
+| 加速档 | 4 | 3 | 16GB+ 内存且 20 支试运行稳定 |
+
+先跑 **20 支试运行**。如果平均每支超过 **30 分钟**，不要直接全量跑，应先检查失败原因、磁盘 I/O、财富号失效率和网络状态。
 
 ---
 
-## 1. 外部参考与可借鉴点
+## 一、数据来源与股票发现
 
-| 参考 | 链接 | 可借鉴点 | 本项目采用方式 |
-| --- | --- | --- | --- |
-| zcyeee/EastMoney_Crawler | https://github.com/zcyeee/EastMoney_Crawler | 原项目以 Selenium + MongoDB 为主，强调反爬重启和断点处理 | 保留 Selenium 作为兜底，不再作为列表/评论主路径 |
-| hogking/eastmoney-guba | https://github.com/hogking/eastmoney-guba | 使用代理池、Redis、MongoDB 做长期运行和去重 | 本项目暂不引入新基础设施，优先压缩单股票流水线耗时 |
-| kayzhou/eastmoney-crawler | https://github.com/kayzhou/eastmoney-crawler | 轻量请求封装，适合证明东方财富部分页面可直接 HTTP 获取 | 列表页改为 `requests + BeautifulSoup + article_list JSON` |
-| 东方财富评论 JSONP 接口 | https://gbapi.eastmoney.com/reply/JSONP/ArticleNewReplyList | 评论可通过 `postid + md5(postid)` 直接获取 JSONP | 评论主路径改为 API 并发，Selenium 只兜底 |
+批量脚本不要强依赖 `数据_list.csv` 的文件名或编码。更稳妥的做法是从股票 CSV 文件自动发现股票代码。
 
-核心判断：这个项目不需要换成 Scrapy 或重写框架。最大收益来自把 Selenium 从“主路径”降级为“兜底路径”，并减少 CSV 大文件重复重写。
+推荐股票发现顺序：
+
+1. 扫描历史 CSV 目录中的 `*.csv`，文件名匹配 `^\d{6}\.csv$`。
+2. 同时扫描项目根目录中的 `*.csv`，排除 `数据_list.csv`、`方象_list.csv` 等非股票文件。
+3. 如果未来保留 list 文件，只作为补充输入，不作为唯一来源。
+
+推荐新增参数：
+
+```powershell
+python auto_pipeline_000001.py --stock 000002 --stage 1 --source-dir e:\guba_project\EastMoney_Crawler\数据
+```
+
+`--source-dir` 行为建议：
+
+- Stage 1 优先查找 `--source-dir\{stock}.csv`。
+- 其次查找项目根目录 `{stock}.csv`。
+- 找到后直接复制到 `temp_extract/{stock}_base.csv`。
+- 不要让 batch worker 反复复制大 CSV 到项目根目录，减少 I/O 和人为清理负担。
+
+如果暂时不实现 `--source-dir`，batch worker 必须在运行 Stage 1 前确认 `{stock}.csv` 已位于项目根目录，否则直接标记 `.failed`，不要进入无意义重试。
 
 ---
 
-## 2. 原瓶颈
+## 二、批量执行设计
 
-| 阶段 | 原问题 | 影响 |
-| --- | --- | --- |
-| Stage 1 列表页 | 每页 `driver.get()` + DOM 查询 | 浏览器启动、渲染、JS 执行成本高 |
-| Stage 1 CSV 状态 | `post_id` 和最新日期分两遍扫描 | 100MB+ CSV 下有多余 I/O |
-| Stage 2 正文写回 | 每 10 条正文重写一次基础 CSV 和新帖 CSV | 大文件场景会把耗时放大到 O(重写次数 * 文件大小) |
-| Stage 2 评论 | 每个有评论帖子都用 Selenium 打开页面 | 是后续 4000+ 股票批处理的最大风险 |
-| 财富号 ID | 新帖 CSV 未正确保存 `post_source_id` | 评论 API 需要股吧 `post_id`，正文 URL 需要财富号文章号 |
-| 批量股票 | 只能改源码里的 `STOCK_CODE` | 4000+ 股票无法稳定批处理 |
+采用队列式 Master-Worker 模式：
+
+- `batch_launcher.ps1`：唯一入口，一次启动 N 个 worker 窗口。
+- `batch_worker.py`：循环抢占股票、串行执行 Stage 1/2/3、写状态文件。
+- `batch_progress/`：共享状态目录。
+
+状态文件固定为：
+
+| 文件 | 含义 |
+|------|------|
+| `{stock}.lock` | 某 worker 正在处理该股票 |
+| `{stock}.done` | 该股票三阶段成功完成 |
+| `{stock}.failed` | 该股票失败，需人工或后续补跑 |
+| `{stock}.retrying` | 当前处于自动重试中 |
+| `{stock}.failed_upload` | Stage 3 上传失败，但本地产物保留 |
+| `{stock}.summary.json` | 本股票耗时、输出大小、退出码、失败原因摘要 |
+
+Worker 串行执行每只股票：
+
+```powershell
+python auto_pipeline_000001.py --stock {stock} --stage 1
+python auto_pipeline_000001.py --stock {stock} --stage 2 --detail-workers 3
+python auto_pipeline_000001.py --stock {stock} --stage 3
+```
+
+每完成一只股票，写入 `{stock}.summary.json`：
+
+```json
+{
+  "stock": "000002",
+  "worker_id": "worker_1",
+  "stage1_seconds": 120,
+  "stage2_seconds": 420,
+  "stage3_seconds": 30,
+  "total_seconds": 570,
+  "enhanced_csv_mb": 118.4,
+  "detail_failed_count": 12,
+  "exit_code": 0,
+  "finished_at": "2026-06-18T14:00:00"
+}
+```
+
+文件锁协议：
+
+- 使用 `os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)` 原子创建 `{stock}.lock`。
+- 创建成功才拥有该股票处理权。
+- 已存在 `.done`、`.failed` 的股票默认跳过。
+- stale lock 默认 **3 小时**。超过 3 小时且 lock 无心跳更新，允许其他 worker 回收。
+
+Worker 每 60 秒刷新当前 `.lock` 文件 mtime，作为心跳。
 
 ---
 
-## 3. 已实施优化
+## 三、失败与恢复硬规则
 
-### 3.1 列表页改为 HTTP 快速解析
+单股票最多自动重试 **2 次**。超过后写 `.failed`，继续下一只，避免单只股票拖垮全局进度。
 
-实现位置：`crawler.py`
+失败分类：
 
-新增逻辑：
-- `PostCrawler._fetch_post_page_fast()`
-- `PostCrawler._extract_article_payload()`
-- `PostCrawler._article_to_post_info()`
+| 场景 | 处理 |
+------|------|
+| Stage 1 缺 CSV | 直接 `.failed`，原因 `missing_source_csv` |
+| CSV 字段缺失或编码不可读 | 直接 `.failed`，原因 `invalid_csv_schema` |
+| 磁盘剩余低于 20GB | 暂停抢新任务，不标记股票失败 |
+| Stage 2 财富号失效/空正文 | 不算失败，写 `{stock}_detail_failed.jsonl`，重跑跳过 |
+| Stage 2 进程异常退出 | 重试，最多 2 次 |
+| Stage 3 本地合并失败 | 重试，最多 2 次；仍失败写 `.failed` |
+| Stage 3 上传失败 | 保留本地产物，写 `.failed_upload`，不删除输出 |
+| worker 窗口崩溃 | lock 超过 3 小时后由其他 worker 回收 |
 
-策略：
-1. 直接请求 `https://guba.eastmoney.com/list,{code},f_{page}.html`。
-2. 从页面内 `var article_list = {...}` 解析结构化帖子数据。
-3. 用 SSR 表格里的可见行顺序过滤隐藏/推荐数据。
-4. 失败时自动回退原 Selenium 列表解析。
+断电/重启恢复：
 
-实测：
-- 第 1 页快速解析：`0.573s`，得到 79 条（保留旧逻辑：跳过首页第一条跨吧/置顶行）。
-- 连续 3 页非写入 benchmark：`0.941s`，239 条，约 `3.19 页/秒`。
+```powershell
+cd e:\guba_project\EastMoney_Crawler
+.\batch_launcher.ps1 -WorkerCount 3
+```
 
-### 3.2 评论改为 API 并发优先
+worker 启动后自动跳过 `.done`，回收 stale `.lock`，继续处理 pending 股票。
 
-实现位置：`crawler.py`
+---
 
-新增逻辑：
-- `CommentCrawler._fetch_comments_via_api()`
-- `CommentCrawler._parse_jsonp()`
-- `CommentCrawler._comment_from_api_reply()`
-- `CommentCrawler.crawl_comment_info()` 重写为 API 并发 + Selenium 兜底
+## 四、磁盘与产物策略
 
-策略：
-1. 使用 `gbapi.eastmoney.com/reply/JSONP/ArticleNewReplyList`。
-2. 参数 `h = md5(post_id)`，`postid = 股吧 post_id`。
-3. 默认 `8` worker 并发。
-4. 单帖最多抓 `5` 页评论，每页 `50` 条。
-5. API 失败，或 CSV 显示有评论但 API 返回空时，进入 Selenium 兜底。
+默认先使用本地留存：
 
-实测：
-- 帖子 `1728375394`：API `0.414s` 获取 3 条评论。
+- Stage 3 输出：`data/{stock}_enhanced.csv`
+- 先跑 20 支，记录平均输出大小。
 
-### 3.3 正文 CSV 写回改为 delta 模式
+全量 2000 支前必须二选一：
 
-实现位置：`auto_pipeline_000001.py`
+| 方案 | 条件 | 做法 |
+|------|------|------|
+| 网盘生产模式 | bypy 稳定、上传带宽足够 | 设置 `SKIP_BAIDU_UPLOAD=False`，Stage 3 上传后清理本地临时文件 |
+| 本地生产模式 | 无稳定网盘 | 准备至少 `250GB` 可用空间，每 200 支归档/转移一次 |
 
-新增逻辑：
-- `_content_delta_path()`
-- `_load_content_delta()`
-- `_append_content_delta()`
-- `_delete_content_delta()`
+Worker 启动每只股票前检查磁盘：
 
-策略：
-1. 爬正文过程中只追加小型 JSONL delta 文件。
-2. 每 50 条保存一次 checkpoint。
-3. 全部完成后统一重写 CSV 一次。
-4. 恢复任务时先读取尚未合并的 delta，防止 checkpoint 存在但正文未写回。
+- 剩余空间 `< 20GB`：暂停抢新股票，打印告警。
+- 剩余空间 `< 10GB`：所有 worker 应停止，等待人工清理。
 
-收益：
-- 原逻辑：每 10 条重写一次 100MB 级 CSV。
-- 新逻辑：每个 Stage 2 正文任务通常只重写一次 CSV。
+每只股票完成后建议清理：
 
-### 3.4 Stage 1 CSV 状态单次扫描
+- 保留：`data/{stock}_enhanced.csv`
+- 保留：`batch_progress/{stock}.done`
+- 保留：`batch_progress/{stock}.summary.json`
+- 删除：`temp_export/{stock}_*.csv`
+- 删除：`.pipeline_flags/{stock}_stage*.done`
+- 删除：`batch_progress/{stock}.lock`
+- 可保留：`temp_extract/{stock}_detail_failed.jsonl`，用于后续审计财富号失效情况
 
-实现位置：`auto_pipeline_000001.py`
+---
 
-新增 `scan_csv_state()`，一次扫描同时得到：
-- 已有 `post_id` 集合
-- 最新日期
-- 最早日期
-- 行数
+## 五、分阶段运行计划
 
-### 3.5 修复财富号 ID 映射
+### Phase 0：单只验证
 
-实现位置：
-- `crawler.py`
-- `parser.py`
-- `auto_pipeline_000001.py`
+目标：确认当前三阶段对 `000001` 或任意一只股票可完整跑通。
 
-新约定：
-- `post_id`：股吧帖子 ID，用于评论 API。
-- `post_source_id`：财富号文章 ID，用于正文 URL。
-- `url`：财富号正文 URL 仍使用 `post_source_id`。
-
-这与历史基础 CSV 的字段含义保持一致。
-
-### 3.6 CLI 支持任意股票代码
-
-实现位置：`auto_pipeline_000001.py`
-
-现在可以直接运行：
+命令：
 
 ```powershell
 python auto_pipeline_000001.py --stock 000001 --stage 1
-python auto_pipeline_000001.py --stock 000002 --stage 1
-python auto_pipeline_000001.py --stock 600000 --stage 1
+python auto_pipeline_000001.py --stock 000001 --stage 2 --detail-workers 3
+python auto_pipeline_000001.py --stock 000001 --stage 3
 ```
 
-无需再手工修改源码里的 `STOCK_CODE`。
+通过门槛：
+
+- 生成 `data/000001_enhanced.csv`。
+- Stage 2 不爬评论、不要求 MongoDB。
+- 财富号失效不会导致长时间卡死。
+
+### Phase 1：20 支试运行
+
+目标：验证真实吞吐、磁盘增长、失败率。
+
+建议：
+
+- `WorkerCount=2` 或 `3`
+- `--detail-workers 3`
+- 记录每只股票 summary
+
+进入下一阶段门槛：
+
+- 成功率 `>= 90%`
+- 平均每支耗时 `<= 30 分钟`
+- 无重复处理同一股票
+- 磁盘增长符合预估
+
+### Phase 2：200 支小批量
+
+目标：验证 overnight 稳定性。
+
+进入下一阶段门槛：
+
+- 连续运行 8 小时以上无系统性卡死。
+- stale lock 能自动恢复。
+- `.failed` 可解释，不出现大量同类错误。
+- 输出 CSV 可正常打开、字段完整。
+
+### Phase 3：全量 2000 支
+
+目标：按 `batch_progress/*.done` 推进。
+
+每日检查：
+
+```powershell
+(Get-ChildItem batch_progress\*.done).Count
+(Get-ChildItem batch_progress\*.failed).Count
+(Get-ChildItem batch_progress\*.failed_upload).Count
+Get-ChildItem batch_progress\*.lock | Select-Object Name,LastWriteTime
+```
+
+全量完成标准：
+
+- `.done >= 2000`
+- `.failed` 有明确原因，可单独补跑
+- `data/` 或网盘中存在对应 enhanced CSV
 
 ---
 
-## 4. 验证结果
+## 六、实现清单
 
-已执行：
+### 必做
+
+1. 新增 `batch_worker.py`
+   - 股票发现
+   - 原子锁抢占
+   - Stage 1/2/3 subprocess 调用
+   - 重试与失败分类
+   - summary JSON 输出
+   - stale lock 回收
+   - 磁盘空间检查
+
+2. 新增 `batch_launcher.ps1`
+   - 参数：`-WorkerCount`
+   - 默认启动 3 个 PowerShell worker
+   - 每个 worker 带唯一 `--worker-id`
+
+3. 建议增强 `auto_pipeline_000001.py`
+   - 增加 `--source-dir`
+   - Stage 1 支持从历史 CSV 目录读取 `{stock}.csv`
+
+### 暂不做
+
+- 不恢复评论爬取。
+- 不把普通股吧帖正文改回详情页爬取。
+- 不追求过高 worker 数，先以稳定跑完为目标。
+
+---
+
+## 七、测试与验收
+
+实现后先跑：
 
 ```powershell
-python -m py_compile auto_pipeline_000001.py crawler.py parser.py
+python -m py_compile auto_pipeline_000001.py crawler.py parser.py batch_worker.py
 python -m unittest discover -s tests
 ```
 
-结果：
-- 编译通过。
-- 单元测试 `27` 个全部通过。
-- 新增离线测试覆盖列表页快速解析和评论 JSONP 扁平化。
-- 真实网络 smoke test 通过：
-  - 列表页第 1 页：`0.573s`
-  - 列表页 3 页：`0.941s`
-  - 评论 API 单帖：`0.414s`
+批量脚本 dry-run：
+
+```powershell
+python batch_worker.py --dry-run --limit 5
+```
+
+验收点：
+
+- dry-run 只打印将处理股票，不创建 `.done`。
+- 3 支股票小批量时，多个 worker 不会重复处理同一股票。
+- 手动杀掉一个 worker 后，超过 stale lock 时间可恢复。
+- 人为移除一个 CSV，会写 `.failed` 并继续下一只。
+- Stage 3 没有评论 CSV 时仍正常产出 enhanced CSV。
+
+全量前验收门槛：
+
+- 20 支试运行成功率 `>= 90%`。
+- 平均每支耗时 `<= 30 分钟`。
+- 没有重复处理同一股票。
+- 磁盘增长与预估一致。
 
 ---
 
-## 5. 风险与控制
+## 八、默认运行命令
 
-| 风险 | 控制 |
-| --- | --- |
-| 东方财富调整 `article_list` 变量名或结构 | 自动回退 Selenium；新增离线测试便于定位 |
-| 评论 API 对少量帖子返回空 | CSV 显示有评论但 API 空时进入 Selenium 兜底 |
-| 评论页数过多导致耗时增加 | 默认最多 5 页/帖，可按任务需要调小或调大 |
-| 并发过高触发限流 | 当前仅评论 API 8 worker；列表页仍按页顺序抓取 |
-| 任务中断导致正文写回未完成 | delta JSONL + checkpoint 恢复后会先合并未写回内容 |
+试运行：
 
----
+```powershell
+cd e:\guba_project\EastMoney_Crawler
+.\batch_launcher.ps1 -WorkerCount 2
+```
 
-## 6. 后续建议
+推荐生产运行：
 
-1. 增加批量调度脚本：读取股票代码列表，按 `--stock` 自动跑 Stage 1/2/3。
-2. 给评论 API worker 增加命令行参数，例如 `--comment-workers 4/8/16`，根据服务器和限流情况调节。
-3. 对 Stage 3 合并导出增加跳过评论选项，便于先完成帖子主数据。
-4. 对 4000+ 股票建议按交易所或代码段分批运行，每批记录耗时、失败代码、API 失败率。
+```powershell
+cd e:\guba_project\EastMoney_Crawler
+.\batch_launcher.ps1 -WorkerCount 3
+```
+
+如果 20 支试运行稳定且内存充足，再考虑：
+
+```powershell
+.\batch_launcher.ps1 -WorkerCount 4
+```
+
+不要一开始就开高并发。当前优先级是 **稳妥完成 2000 支**，不是追求单日最高速度。

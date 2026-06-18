@@ -218,8 +218,8 @@ nano ~/guba_crawler/EastMoney_Crawler/main.py
 
 ## 2.4 000001 自动化流水线（CSV-Native 高速版）
 
-> 针对个股 **000001** 的完整自动化流程：提取历史数据 → 补爬正文/财富号 → 爬取新帖 → 整合 → 上传百度网盘 → 清理空间。
-> 只需创建 **3 个 tmux 会话**，按顺序运行三个阶段即可。
+> 针对个股 **000001** 的完整自动化流程：提取历史数据 → 补爬正文 → 爬取新帖 → 整合 → 上传百度网盘 → 清理空间。
+> 只需创建 **3 个 PowerShell 窗口**，按顺序运行三个阶段即可。
 
 ### 优化原理
 
@@ -236,19 +236,13 @@ nano ~/guba_crawler/EastMoney_Crawler/main.py
 
 ### 前置要求
 
-**1. 启动 MongoDB（评论爬取需要）：**
-
-```powershell
-.\start_mongodb.ps1
-```
-
-**2. 确保依赖已安装：**
+**1. 确保依赖已安装：**
 
 ```powershell
 pip install pymongo selenium pandas tqdm beautifulsoup4 requests
 ```
 
-**3. （可选）百度网盘上传（Stage 3 需要，可跳过）：**
+**2. （可选）百度网盘上传（Stage 3 需要，可跳过）：**
 
 ```bash
 bypy info
@@ -273,20 +267,24 @@ python auto_pipeline_000001.py --stock 000001 --stage 1
 
 > 保持窗口打开即可，爬虫在后台运行。
 
-### 阶段 2：爬取正文 + 评论
+### 阶段 2：爬取正文
 
 **等 Stage 1 完成后**（观察窗口输出或检查标记文件），打开第二个 PowerShell 窗口：
 
 ```powershell
 cd e:\guba_project\EastMoney_Crawler
 python auto_pipeline_000001.py --stock 000001 --stage 2
+
+# 或自定义并发 worker 数（默认 3）
+python auto_pipeline_000001.py --stock 000001 --stage 2 --detail-workers 4
 ```
 
 该阶段自动完成：
-1. 从 **基础 CSV + 新帖子 CSV** 中筛选所有 **`content` 为空** 的帖子（包括财富号和非财富号），仅补爬缺失正文的帖子
-2. **如果没有需要补爬的帖子**，直接标记 Stage 2 完成并退出，不会重复爬取已有数据
-3. 爬取帖子正文，通过**流式重写 CSV** 更新 `content` 字段（内存占用极低）
-4. 从 CSV 读取 `comment_num > 0` 的帖子，爬取**评论信息**（需要 MongoDB 运行中）
+1. 从 CSV 筛选所有 **`content` 为空** 的帖子
+2. **普通股吧帖**：content 直接用 `post_title` 填充（本地秒完成，不爬详情页）
+3. **财富号帖子**：走多线程 requests 补爬完整正文
+4. 正文通过**增量 JSONL** 持久化（断点续爬友好），最后统一写回 CSV
+5. **不爬评论，不需要 MongoDB**
 
 ### 阶段 3：整合 + 导出到 data/
 
@@ -298,19 +296,15 @@ python auto_pipeline_000001.py --stock 000001 --stage 3
 ```
 
 该阶段自动完成：
-1. **流式合并** 基础 CSV + 新帖子 CSV → `000001_enhanced.csv`
-2. 从 MongoDB 导出评论 → `000001_comments.csv`
-3. **复制到 `data/` 目录**（`SKIP_BAIDU_UPLOAD=True` 本地检查模式，跳过上传和清理）
-4. 临时文件保留不删，方便检查
+1. **按时间降序合并** 基础 CSV + 新帖子 CSV → `000001_enhanced.csv`（新帖在前）
+2. **复制到 `data/` 目录**（`SKIP_BAIDU_UPLOAD=True` 本地检查模式，跳过上传和清理）
+3. 不导出评论 CSV
 
 > 检查完毕后，将 `auto_pipeline_000001.py` 中的 `SKIP_BAIDU_UPLOAD` 改为 `False` 即可恢复百度网盘上传 + 清理流程。
 
 ### 流水线命令速查
 
 ```powershell
-# ====== 启动 MongoDB ======
-.\start_mongodb.ps1
-
 # ====== 分别在新 PowerShell 窗口运行三个阶段 ======
 # 窗口 1: Stage 1
 cd e:\guba_project\EastMoney_Crawler
@@ -319,6 +313,9 @@ python auto_pipeline_000001.py --stock 000001 --stage 1
 # 窗口 2: Stage 2（等 Stage 1 完成）
 cd e:\guba_project\EastMoney_Crawler
 python auto_pipeline_000001.py --stock 000001 --stage 2
+
+# 窗口 2（自定义并发数，默认 3）：
+python auto_pipeline_000001.py --stock 000001 --stage 2 --detail-workers 4
 
 # 窗口 3: Stage 3（等 Stage 2 完成）
 cd e:\guba_project\EastMoney_Crawler
@@ -330,9 +327,6 @@ dir e:\guba_project\EastMoney_Crawler\.pipeline_flags\
 
 # ====== 查看网盘上传结果（需 bypy） ======
 bypy list /apps/bypy/guba_crawl/000001/
-
-# ====== 停止 MongoDB（不再需要时） ======
-.\stop_mongodb.ps1
 ```
 
 ### 切换到下一只股票
