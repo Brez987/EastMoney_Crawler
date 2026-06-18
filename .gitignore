@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Virtual environment
+venv/
+
+# 本地工具（Chrome/ChromeDriver/MongoDB 便携版）
+tools/
+
+# 爬取数据（CSV 大文件）
+*.csv
+*.rar
+
+# 临时文件
+temp_extract/
+temp_export/
+.pipeline_flags/
+
+# IDE
+.idea/
+.vscode/
+
+# 日志和临时文件
+*.log
+*.tmp
+
+# PowerShell 脚本产生的暂存
+*.ps1.tmp
