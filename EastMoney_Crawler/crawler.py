@@ -103,8 +103,11 @@ class PostCrawler(object):
         url = f'https://guba.eastmoney.com/list,{self.symbol},f_{page_num}.html'
         resp = self.session.get(url, timeout=(3, 12))
         resp.raise_for_status()
+        # 检查重定向到验证页或返回了验证页内容
         if 'fd_guba_validate' in resp.url or '身份核实' in resp.text[:5000]:
             raise RuntimeError('list page redirected to validation')
+        # 有时验证页不会触发 URL 变化，而是直接返回空或验证提示；若未解析到 article_list，
+        # 调用方会抛出 ValueError，此处不额外拦截，让外层重试机制生效。
         resp.encoding = resp.encoding or 'utf-8'
         return resp.text
 
@@ -417,6 +420,10 @@ class PostCrawler(object):
 
         财富号历史文章可能已删除/失效。此处不能调用 parse_post_detail()，
         因为它在 requests 为空时会回退 Selenium，失效文章多时会导致 Stage 2 长时间卡住。
+
+        反爬说明：当前 IP 被拦截时，财富号 requests 也会返回 403/空响应，
+        继续多线程高频重试只会加重封禁。因此当连续失败达到阈值时，主动
+        暂停并提示用户降低并发或等待解封。
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -426,17 +433,27 @@ class PostCrawler(object):
         parser = PostParser()
         success_count = 0
         error_count = 0
+        consecutive_http_fail = 0
         lock = threading.Lock()
+        # 当连续 HTTP 失败达到该阈值，认为 IP 已被全局拦截，停止继续冲击
+        MAX_CONSECUTIVE_HTTP_FAIL = 50
 
         def crawl_one(post):
-            nonlocal success_count, error_count
+            nonlocal success_count, error_count, consecutive_http_fail
             post_id = post['_id']
             post_url = post['post_url']
+
+            # 全局拦截检测：避免无意义请求加重封禁
+            with lock:
+                if consecutive_http_fail >= MAX_CONSECUTIVE_HTTP_FAIL:
+                    return False
 
             try:
                 detail = parser._try_requests_caifuhao(post_url)
 
                 if detail['post_content']:
+                    with lock:
+                        consecutive_http_fail = 0
                     update_data = {'post_content': detail['post_content']}
                     if detail.get('post_title'):
                         update_data['post_title'] = detail['post_title']
@@ -457,6 +474,7 @@ class PostCrawler(object):
                 else:
                     # 正文为空/文章失效 → 持久记录为失败，后续重跑直接跳过。
                     with lock:
+                        consecutive_http_fail += 1
                         if update_callback:
                             update_callback(
                                 post_id,
@@ -472,6 +490,7 @@ class PostCrawler(object):
 
             except Exception as e:
                 with lock:
+                    consecutive_http_fail += 1
                     if update_callback:
                         update_callback(
                             post_id,
@@ -487,11 +506,20 @@ class PostCrawler(object):
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(crawl_one, post) for post in posts]
+            interrupted = False
             for future in as_completed(futures):
                 future.result()  # 等待所有任务完成
-                processed = success_count + error_count
-                if processed % 20 == 0 or processed == total:
-                    print(f'{self.symbol}: 财富号进度 {processed}/{total}，成功 {success_count}，失效/失败 {error_count}')
+                with lock:
+                    if consecutive_http_fail >= MAX_CONSECUTIVE_HTTP_FAIL and not interrupted:
+                        print(f'{self.symbol}: 财富号请求连续失败 {consecutive_http_fail} 次，'
+                              f'疑似 IP 已被全局拦截，停止继续爬取。'
+                              f'建议等待一段时间后重试或更换网络环境。')
+                        interrupted = True
+                    processed = success_count + error_count
+                    if processed % 20 == 0 or processed == total:
+                        print(f'{self.symbol}: 财富号进度 {processed}/{total}，成功 {success_count}，失效/失败 {error_count}')
+                if interrupted:
+                    break
 
         print(f'{self.symbol}: 财富号爬取完成，成功 {success_count}，失败 {error_count}')
 
@@ -762,7 +790,12 @@ class PostCrawler(object):
         retries: int = 3,
         base_delay: float = 1.0,
     ) -> list:
-        """带指数退避的页面抓取，requests 失败时回退 Selenium。"""
+        """带指数退避的页面抓取，requests 失败时回退 Selenium。
+
+        注意：回退 Selenium 前会判断失败原因。对于已确认的验证码/验证页，
+        Selenium 一样会被拦截，继续尝试只会浪费资源；直接抛出异常由外层
+        重试逻辑处理，并计入 failed_pages。
+        """
         last_error = None
         for attempt in range(retries + 1):
             try:
@@ -775,6 +808,12 @@ class PostCrawler(object):
                 if 'fd_guba_validate' in str(e) or '身份核实' in str(e):
                     print(f'{self.symbol}: 第 {page_num} 页触发验证，暂停 60 秒')
                     time.sleep(60)
+
+        err_text = str(last_error)
+        # 当 requests 已明确返回验证页时，Selenium 也会被拦截，没必要回退
+        if 'fd_guba_validate' in err_text or '身份核实' in err_text:
+            raise RuntimeError(f'page {page_num} blocked by validation: {last_error}')
+
         print(f'{self.symbol}: 第 {page_num} 页 requests 连续失败 {retries + 1} 次，回退 Selenium: {last_error}')
         try:
             parser = PostParser()

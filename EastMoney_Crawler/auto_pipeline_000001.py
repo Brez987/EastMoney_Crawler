@@ -642,8 +642,8 @@ def run_stage1_full(start_date: str, list_workers: int):
           f'时间范围={summary.get("min_time")} ~ {summary.get("max_time")}')
 
     if summary.get('failed_pages'):
-        print(f'[错误] Stage 1 full 存在失败页面: {summary["failed_pages"]}')
-        return False
+        print(f'[警告] Stage 1 full 存在失败页面: {summary["failed_pages"]}')
+        print(f'[警告] 继续写入 manifest，后续可在网络环境改善后通过 --retry-failed 补爬')
 
     write_full_manifest(STOCK_CODE, start_date, summary)
     print(f'  ✓ full manifest 已写入: {full_manifest_path(STOCK_CODE)}')
@@ -1173,8 +1173,8 @@ def export_full_posts(stock_code: str, start_date: str) -> str | None:
         return None
 
     if manifest.get('failed_pages'):
-        print(f'  [错误] Stage 1 full 存在失败页面: {manifest["failed_pages"]}')
-        return None
+        print(f'  [警告] Stage 1 full 存在失败页面: {manifest["failed_pages"]}')
+        print(f'  [警告] 继续导出；缺失页可在网络环境改善后补爬')
 
     if not os.path.exists(full_csv):
         print(f'  [错误] full_posts CSV 不存在: {full_csv}')
