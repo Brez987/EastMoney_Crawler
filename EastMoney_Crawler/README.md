@@ -220,6 +220,8 @@ nano ~/guba_crawler/EastMoney_Crawler/main.py
 
 > 针对个股 **000001** 的完整自动化流程：提取历史数据 → 补爬正文 → 爬取新帖 → 整合 → 上传百度网盘 → 清理空间。
 > 只需创建 **3 个 PowerShell 窗口**，按顺序运行三个阶段即可。
+>
+> **重要：本仓库仅包含代码，不包含历史基线 CSV。运行前必须为每只股票准备 `000001.csv` 形式的历史数据文件，否则 Stage 1 会失败。**
 
 ### 优化原理
 
@@ -255,15 +257,24 @@ bypy info
 
 ```powershell
 cd e:\guba_project\EastMoney_Crawler
-python auto_pipeline_000001.py --stock 000001 --stage 1
+python auto_pipeline_000001.py --stock 000001 --stage 1 --source-dir e:\guba_project\EastMoney_Crawler\数据
 ```
 
+> **建议始终显式传入 `--source-dir`，避免依赖不明确的默认查找路径。** 没有历史 CSV 时，Stage 1 会直接失败。
+
 该阶段自动完成：
-1. 优先读取项目目录下 `000001.csv`（无 `数据.rar` 时回退本地 CSV）
+1. 优先从 `--source-dir\000001.csv` 读取历史 CSV（无 `数据.rar` 时回退本地 CSV）
 2. **读取所有 `post_id` 到内存 `set`**（约 1.2 秒，244K 条记录）
 3. **分析 CSV 最新帖子日期**（如 `2025-01-22`），作为增量补爬的停止阈值
 4. 从第 1 页开始爬取帖子列表，**当一页中所有帖子日期 <= CSV 最新日期时自动停止**，只保留 CSV 截止日期之后的**新帖子**
 5. 新帖子直接追加到 CSV，旧数据不导入 MongoDB，省去大量 I/O 时间
+6. 写入 `temp_extract\000001_stage1_manifest.json`，记录 source_rows / new_rows / source_sha256，供 Stage 3 强校验
+
+如果更新了历史 CSV，加 `--force-refresh-base` 重新复制 base：
+
+```powershell
+python auto_pipeline_000001.py --stock 000001 --stage 1 --source-dir e:\guba_project\EastMoney_Crawler\数据 --force-refresh-base
+```
 
 > 保持窗口打开即可，爬虫在后台运行。
 
@@ -296,11 +307,16 @@ python auto_pipeline_000001.py --stock 000001 --stage 3
 ```
 
 该阶段自动完成：
-1. **按时间降序合并** 基础 CSV + 新帖子 CSV → `000001_enhanced.csv`（新帖在前）
-2. **复制到 `data/` 目录**（`SKIP_BAIDU_UPLOAD=True` 本地检查模式，跳过上传和清理）
-3. 不导出评论 CSV
+1. **强校验**：读取 `temp_extract\000001_stage1_manifest.json`，确认 `*_base.csv` 行数与 manifest 一致
+2. 若 manifest 期望 `*_new_posts.csv` 有数据但该文件缺失，Stage 3 **会直接失败**，不再静默跳过
+3. **按时间降序合并** 基础 CSV + 新帖子 CSV → `000001_enhanced.csv`（新帖在前）
+4. **行数校验**：`out_rows == base_rows + new_rows`
+5. **复制到 `data/` 目录**（`SKIP_BAIDU_UPLOAD=True` 本地检查模式，跳过上传和清理）
+6. 不导出评论 CSV
 
 > 检查完毕后，将 `auto_pipeline_000001.py` 中的 `SKIP_BAIDU_UPLOAD` 改为 `False` 即可恢复百度网盘上传 + 清理流程。
+>
+> 若 Stage 3 报错「manifest 缺失」或「base 行数与 manifest 不符」，请删除该股票临时产物后重新跑 Stage 1。
 
 ### 流水线命令速查
 

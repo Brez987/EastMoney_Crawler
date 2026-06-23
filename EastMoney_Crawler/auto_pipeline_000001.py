@@ -25,6 +25,7 @@ import threading
 import subprocess
 import shutil
 import argparse
+import hashlib
 from datetime import datetime
 
 import pandas as pd
@@ -118,6 +119,11 @@ def new_posts_csv_path(stock_code: str) -> str:
     return os.path.join(TEMP_DIR, f'{stock_code}_new_posts.csv')
 
 
+def stage1_manifest_path(stock_code: str) -> str:
+    """Stage 1 产物清单，Stage 2/3 据此校验"""
+    return os.path.join(TEMP_DIR, f'{stock_code}_stage1_manifest.json')
+
+
 def enhanced_csv_path(stock_code: str) -> str:
     """Stage 3 整合后的最终 CSV"""
     return os.path.join(EXPORT_DIR, f'{stock_code}_enhanced.csv')
@@ -151,6 +157,15 @@ def default_source_dirs() -> list:
             seen.add(key)
             unique_dirs.append(path)
     return unique_dirs
+
+
+def file_sha256(path: str) -> str:
+    """计算文件 SHA256，用于检测历史源 CSV 是否变化。"""
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def resolve_source_csv(stock_code: str, source_dirs: list = None) -> str:
@@ -331,7 +346,85 @@ def crawl_post_list(stock_code: str, existing_ids: set, stop_date: str):
     print(f'  ✓ 新帖子已追加到 CSV，新增 {new_count[0]} 条，过滤重复 {skip_count[0]} 条')
 
 
-def run_stage1(source_dirs: list = None):
+def write_stage1_manifest(
+    stock_code: str,
+    source_csv: str | None,
+    source_rows: int,
+    source_sha256: str,
+    source_latest_date: str,
+    new_rows: int,
+):
+    """持久化 Stage 1 产物清单，供 Stage 2/3 校验。"""
+    manifest = {
+        "stock": stock_code,
+        "source_csv": source_csv,
+        "source_rows": source_rows,
+        "source_sha256": source_sha256,
+        "source_latest_date": source_latest_date,
+        "new_posts_csv": new_posts_csv_path(stock_code),
+        "new_rows": new_rows,
+        "created_at": datetime.now().isoformat(),
+    }
+    path = stage1_manifest_path(stock_code)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def read_stage1_manifest(stock_code: str) -> dict | None:
+    path = stage1_manifest_path(stock_code)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def validate_stage1_inputs(stock_code: str, source_dirs: list | None, force_refresh_base: bool = False) -> tuple[str | None, bool]:
+    """返回 (source_csv 路径, 是否复用了已有 base)。
+
+    当以下情况之一时，强制重建 base：
+      - force_refresh_base=True
+      - 源文件与 manifest 记录不一致（sha256/size/行数）
+      - 已有 base 与当前源文件不一致
+    """
+    base_path = base_csv_path(stock_code)
+    source_csv = resolve_source_csv(stock_code, source_dirs)
+
+    if force_refresh_base:
+        print("  --force-refresh-base 已开启，强制重建 base CSV")
+        return source_csv, False
+
+    manifest = read_stage1_manifest(stock_code)
+    if manifest and source_csv:
+        manifest_sha = manifest.get("source_sha256", "")
+        manifest_rows = manifest.get("source_rows", 0)
+        current_sha = file_sha256(source_csv)
+        _, _, _, current_rows = scan_csv_state(source_csv)
+        if manifest_sha != current_sha or manifest_rows != current_rows:
+            print(f"[警告] 历史源 CSV 与 Stage 1 manifest 不一致，强制重建 base")
+            print(f"  sha256: {manifest_sha[:16]}... -> {current_sha[:16]}...")
+            print(f"  rows: {manifest_rows} -> {current_rows}")
+            return source_csv, False
+
+    if os.path.exists(base_path):
+        if source_csv:
+            # 即使 manifest 不存在，也兜底比较一次
+            base_sha = file_sha256(base_path)
+            src_sha = file_sha256(source_csv)
+            if base_sha != src_sha:
+                print(f"[警告] temp_extract 中的 base CSV 与源文件不一致，将重新复制")
+                return source_csv, False
+        return source_csv, True
+
+    return source_csv, False
+
+
+def run_stage1(source_dirs: list = None, force_refresh_base: bool = False):
     print(f'\n{"="*60}')
     print(f'[Stage 1] {STOCK_CODE} 提取 CSV + 爬取帖子列表')
     print(f'{"="*60}')
@@ -343,8 +436,11 @@ def run_stage1(source_dirs: list = None):
 
     # 1. 获取基础 CSV（优先从 source-dir / 本地历史目录复制，回退到 RAR 提取）
     base_path = base_csv_path(STOCK_CODE)
-    if not os.path.exists(base_path):
-        source_csv = resolve_source_csv(STOCK_CODE, source_dirs)
+    source_csv, reuse_base = validate_stage1_inputs(STOCK_CODE, source_dirs, force_refresh_base)
+
+    if reuse_base and os.path.exists(base_path):
+        print(f'\n[Stage 1-1] 基础 CSV 已存在且与源一致，跳过复制: {base_path}')
+    else:
         if source_csv:
             print(f'\n[Stage 1-1] 使用历史 CSV: {source_csv}')
             shutil.copy2(source_csv, base_path)
@@ -355,13 +451,12 @@ def run_stage1(source_dirs: list = None):
             if not csv_path:
                 print('提取 CSV 失败，终止')
                 return False
+            source_csv = csv_path
         else:
             searched = ', '.join(default_source_dirs() + (source_dirs or []))
             print(f'[错误] 未找到 {STOCK_CODE}.csv，也没有可用数据.rar，无法继续')
             print(f'  已查找目录: {searched}')
             return False
-    else:
-        print(f'\n[Stage 1-1] 基础 CSV 已存在，跳过: {base_path}')
 
     csv_path = base_path
 
@@ -373,11 +468,33 @@ def run_stage1(source_dirs: list = None):
     print(f'  → 将补爬 {stop_date} 之后的新帖子')
 
     # 3. 爬取帖子列表（从第1页开始，遇到旧帖自动停止，新帖子直接追加 CSV）
+    #    开始前清空旧 new_posts.csv，避免把上一次运行结果重复计入
+    new_csv = new_posts_csv_path(STOCK_CODE)
+    if os.path.exists(new_csv):
+        os.remove(new_csv)
+        print(f'  已清空旧新帖 CSV: {new_csv}')
+
     crawl_post_list(STOCK_CODE, existing_ids, stop_date)
+
+    new_rows = 0
+    if os.path.exists(new_csv):
+        _, _, _, new_rows = scan_csv_state(new_csv)
+
+    source_sha = file_sha256(source_csv) if source_csv else ""
+    write_stage1_manifest(
+        STOCK_CODE,
+        source_csv=source_csv,
+        source_rows=count,
+        source_sha256=source_sha,
+        source_latest_date=stop_date or "",
+        new_rows=new_rows,
+    )
+    print(f'  ✓ Stage 1 manifest 已写入: {stage1_manifest_path(STOCK_CODE)}')
+    print(f'    source_rows={count}, new_rows={new_rows}')
 
     set_flag('stage1')
     print(f'\n{"="*60}')
-    print(f'[Stage 1] 完成！请在新 tmux 会话中运行 Stage 2')
+    print(f'[Stage 1] 完成！请在新 PowerShell 窗口运行 Stage 2')
     print(f'{"="*60}')
     return True
 
@@ -740,23 +857,75 @@ def run_stage2(detail_workers: int = 3):
 
 # ==================== Stage 3 ====================
 
-def merge_csv_files(stock_code: str) -> str:
-    """合并基础 CSV 和新帖子 CSV，按 post_publish_time 降序排列（新帖在前）"""
+def _count_csv_rows(csv_path: str) -> int:
+    """返回 CSV 数据行数（不含表头）。"""
+    if not os.path.exists(csv_path):
+        return 0
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        return sum(1 for _ in csv.DictReader(f))
+
+
+def merge_csv_files(stock_code: str, require_manifest: bool = True) -> str | None:
+    """合并基础 CSV 和新帖子 CSV，按 post_publish_time 降序排列（新帖在前）。
+
+    Args:
+        require_manifest: 为 True 时，Stage 1 manifest 缺失或关键产物不匹配会返回 None。
+    """
     print(f'\n[Stage 3-1] 合并基础数据与新爬取帖子（按时间降序）...')
     base_csv = base_csv_path(stock_code)
     new_csv = new_posts_csv_path(stock_code)
     out_csv = enhanced_csv_path(stock_code)
 
+    # 强校验 1: base CSV 必须存在
+    if not os.path.exists(base_csv):
+        print(f'  [错误] 基础 CSV 不存在，无法合并: {base_csv}')
+        print(f'  请确认 Stage 1 已成功运行并生成 {base_csv}')
+        return None
+
+    # 强校验 2: 读取 Stage 1 manifest，与当前产物做一致性检查
+    manifest = read_stage1_manifest(stock_code)
+    if require_manifest:
+        if not manifest:
+            print(f'  [错误] 未找到 Stage 1 manifest: {stage1_manifest_path(stock_code)}')
+            print(f'  请重新运行 Stage 1，确保生成 manifest 后再执行 Stage 3')
+            return None
+
+        expected_source_rows = manifest.get('source_rows', 0)
+        expected_new_rows = manifest.get('new_rows', 0)
+        actual_base_rows = _count_csv_rows(base_csv)
+        actual_new_rows = _count_csv_rows(new_csv)
+
+        if actual_base_rows != expected_source_rows:
+            print(f'  [错误] base 行数与 manifest 不符: manifest={expected_source_rows}, actual={actual_base_rows}')
+            print(f'  建议删除该股票的临时产物后重新跑 Stage 1')
+            return None
+
+        # new_posts.csv 缺失但 manifest 期望有数据 -> 直接失败
+        if expected_new_rows > 0 and actual_new_rows == 0:
+            print(f'  [错误] manifest 期望 {expected_new_rows} 条新帖，但 {new_csv} 不存在或为空')
+            print(f'  请重新跑 Stage 1，或检查是否误删了新帖 CSV')
+            return None
+
+        if actual_new_rows != expected_new_rows:
+            print(f'  [警告] new_posts 行数与 manifest 不符: manifest={expected_new_rows}, actual={actual_new_rows}')
+            print(f'  将继续合并，但请确认数据完整性')
+    else:
+        print(f'  [警告] 未启用 manifest 校验（require_manifest=False）')
+
     all_rows = []
+    row_counts = {}
 
     for src_path, label in [(base_csv, '基础数据'), (new_csv, '新帖子')]:
         if not os.path.exists(src_path):
             continue
+        rows = 0
         with open(src_path, 'r', encoding='utf-8') as f_in:
             reader = csv.DictReader(f_in)
             for row in reader:
                 all_rows.append(row)
-        print(f'  已读取 {label}: {src_path}')
+                rows += 1
+        row_counts[label] = rows
+        print(f'  已读取 {label}: {src_path} ({rows} 条)')
 
     # 按 post_publish_time 降序排列（最新的排最前面）
     def _sort_key(row):
@@ -773,11 +942,18 @@ def merge_csv_files(stock_code: str) -> str:
         writer.writeheader()
         writer.writerows(all_rows)
 
+    # 强校验 3: 输出行数应等于 base + new 行数之和
+    expected_total = row_counts.get('基础数据', 0) + row_counts.get('新帖子', 0)
+    if total != expected_total:
+        print(f'  [错误] 整合后行数异常: expected={expected_total}, actual={total}')
+        return None
+
     file_size = os.path.getsize(out_csv) / 1024 / 1024
     # 显示首尾时间范围
     first_ts = all_rows[0].get('post_publish_time', '?') if all_rows else '?'
     last_ts = all_rows[-1].get('post_publish_time', '?') if all_rows else '?'
     print(f'  ✓ 整合完成: {total} 条记录 ({file_size:.1f} MB)，时间范围 {first_ts} ~ {last_ts} → {out_csv}')
+    print(f'    base_rows={row_counts.get("基础数据", 0)}, new_rows={row_counts.get("新帖子", 0)}')
     return out_csv
 
 
@@ -934,7 +1110,10 @@ def run_stage3():
         return False
 
     # 1. 合并 CSV（不导出评论）
-    post_csv = merge_csv_files(STOCK_CODE)
+    post_csv = merge_csv_files(STOCK_CODE, require_manifest=True)
+    if not post_csv:
+        print('[错误] Stage 3 合并失败，已中止')
+        return False
 
     # 2. 输出到 data/ 目录（本地检查模式）或上传百度网盘
     if SKIP_BAIDU_UPLOAD:
@@ -978,11 +1157,13 @@ def main():
                         help='Stage 2 财富号正文 requests 并发数，默认 3。设为 1 回退单线程')
     parser.add_argument('--source-dir', action='append', default=[],
                         help='Stage 1 历史 CSV 目录，可重复传入；优先查找 {stock}.csv')
+    parser.add_argument('--force-refresh-base', action='store_true',
+                        help='Stage 1 强制从 --source-dir 重新复制最新历史 CSV，忽略 temp_extract 中已存在的 base')
     args = parser.parse_args()
     STOCK_CODE = str(args.stock).strip().zfill(6)
 
     if args.stage == 1:
-        ok = run_stage1(source_dirs=args.source_dir)
+        ok = run_stage1(source_dirs=args.source_dir, force_refresh_base=args.force_refresh_base)
     elif args.stage == 2:
         ok = run_stage2(detail_workers=args.detail_workers)
     elif args.stage == 3:

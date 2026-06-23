@@ -264,6 +264,34 @@ def detail_failed_count(stock: str) -> int:
         return sum(1 for line in handle if line.strip())
 
 
+def clean_per_stock_temp(stock: str) -> None:
+    """处理某只股票前清理该股票的旧临时产物，避免过期 base/new 被复用。"""
+    patterns = [
+        DEFAULT_TEMP_DIR / f"{stock}_base.csv",
+        DEFAULT_TEMP_DIR / f"{stock}_new_posts.csv",
+        DEFAULT_TEMP_DIR / f"{stock}_stage1_manifest.json",
+        DEFAULT_TEMP_DIR / f"{stock}_detail_failed.jsonl",
+        DEFAULT_TEMP_DIR / f"{stock}_content_delta.jsonl",
+        DEFAULT_TEMP_DIR / f"{stock}_detail_checkpoint.json",
+        PROJECT_DIR / "temp_export" / f"{stock}_enhanced.csv",
+        PROJECT_DIR / "temp_export" / f"{stock}_comments.csv",
+        PROJECT_DIR / ".pipeline_flags" / f"{stock}_stage1.done",
+        PROJECT_DIR / ".pipeline_flags" / f"{stock}_stage2.done",
+        PROJECT_DIR / "batch_progress" / f"{stock}.lock",
+        PROJECT_DIR / "batch_progress" / f"{stock}.retrying",
+    ]
+    removed = []
+    for path in patterns:
+        try:
+            if path.exists():
+                path.unlink()
+                removed.append(path.name)
+        except OSError:
+            pass
+    if removed:
+        print(f"[{stock}] cleaned stale temp files: {', '.join(removed)}")
+
+
 def stream_subprocess(cmd: list[str], stage: int, stock: str) -> StageResult:
     started = time.time()
     print(f"[{stock}][stage {stage}] running: {' '.join(cmd)}")
@@ -344,6 +372,9 @@ def run_stock_pipeline(
     if not valid:
         summary.update({"failed_reason": reason, "finished_at": now_iso()})
         return False, summary, reason
+
+    # 每次尝试前都清理该股票的旧临时产物，保证 Stage 1 从干净状态开始
+    clean_per_stock_temp(stock)
 
     total_started = time.time()
     final_reason = ""
