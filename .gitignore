@@ -12,6 +12,7 @@ tools/
 # 爬取数据（CSV 大文件）
 *.csv
 *.rar
+*.zip
 
 # 临时文件
 temp_extract/
@@ -24,6 +25,7 @@ temp_export/
 
 # 批量 Worker 运行时状态
 batch_progress/
+batch_progress_full_20090101/
 batch_logs/
 
 # 日志和临时文件

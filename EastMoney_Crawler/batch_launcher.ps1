@@ -1,10 +1,14 @@
 param(
     [int]$WorkerCount = 3,
     [int]$DetailWorkers = 3,
+    [int]$ListWorkers = 6,
     [int]$MaxRetries = 2,
     [double]$StaleLockHours = 3,
     [double]$MinFreeGb = 20,
     [int]$Limit = 0,
+    [string]$CrawlMode = "incremental",
+    [string]$StartDate = "2009-01-01",
+    [string]$StockList = "",
     [string[]]$SourceDir = @(),
     [string]$ProgressDir = "",
     [string]$Python = "python",
@@ -22,18 +26,29 @@ $env:PYTHONIOENCODING = "utf-8"
 $env:PYTHONUTF8 = "1"
 
 if (-not $ProgressDir) {
-    $ProgressDir = Join-Path $ProjectDir "batch_progress"
+    if ($CrawlMode -eq "full") {
+        $ProgressDir = Join-Path $ProjectDir "batch_progress_full_20090101"
+    } else {
+        $ProgressDir = Join-Path $ProjectDir "batch_progress"
+    }
 }
 
 Write-Host "Project: $ProjectDir"
+Write-Host "Crawl mode: $CrawlMode"
 Write-Host "Workers: $WorkerCount"
 Write-Host "Detail workers per stock: $DetailWorkers"
+if ($CrawlMode -eq "full") {
+    Write-Host "List workers per stock: $ListWorkers"
+    Write-Host "Start date: $StartDate"
+}
 Write-Host "Progress dir: $ProgressDir"
-if ($SourceDir.Count -eq 0) {
-    Write-Host "Source dirs: batch_worker defaults"
-} else {
-    Write-Host "Source dirs:"
-    $SourceDir | ForEach-Object { Write-Host "  - $_" }
+if ($CrawlMode -eq "incremental") {
+    if ($SourceDir.Count -eq 0) {
+        Write-Host "Source dirs: batch_worker defaults"
+    } else {
+        Write-Host "Source dirs:"
+        $SourceDir | ForEach-Object { Write-Host "  - $_" }
+    }
 }
 
 for ($i = 1; $i -le $WorkerCount; $i++) {
@@ -41,6 +56,7 @@ for ($i = 1; $i -le $WorkerCount; $i++) {
     $workerArgs = @(
         "batch_worker.py",
         "--worker-id", $workerId,
+        "--crawl-mode", $CrawlMode,
         "--detail-workers", "$DetailWorkers",
         "--max-retries", "$MaxRetries",
         "--stale-lock-hours", "$StaleLockHours",
@@ -48,8 +64,16 @@ for ($i = 1; $i -le $WorkerCount; $i++) {
         "--progress-dir", $ProgressDir
     )
 
-    foreach ($dir in $SourceDir) {
-        $workerArgs += @("--source-dir", $dir)
+    if ($CrawlMode -eq "full") {
+        $workerArgs += @("--start-date", $StartDate)
+        $workerArgs += @("--list-workers", "$ListWorkers")
+        if ($StockList) {
+            $workerArgs += @("--stock-list", $StockList)
+        }
+    } else {
+        foreach ($dir in $SourceDir) {
+            $workerArgs += @("--source-dir", $dir)
+        }
     }
 
     if ($Limit -gt 0) {
@@ -79,6 +103,11 @@ for ($i = 1; $i -le $WorkerCount; $i++) {
 }
 
 Write-Host "Use these commands to monitor progress:"
-Write-Host "  (Get-ChildItem batch_progress\*.done).Count"
-Write-Host "  (Get-ChildItem batch_progress\*.failed).Count"
+if ($CrawlMode -eq "full") {
+    Write-Host "  (Get-ChildItem batch_progress_full_20090101\*.done).Count"
+    Write-Host "  (Get-ChildItem batch_progress_full_20090101\*.failed).Count"
+} else {
+    Write-Host "  (Get-ChildItem batch_progress\*.done).Count"
+    Write-Host "  (Get-ChildItem batch_progress\*.failed).Count"
+}
 Write-Host "  Get-ChildItem batch_logs\*.log"

@@ -67,6 +67,11 @@ CSV_FIELDNAMES = [
     'post_title', 'url', 'content'
 ]
 
+# 全局运行模式（由命令行参数设置）
+CRAWL_MODE = 'incremental'  # 'incremental' | 'full'
+START_DATE = '2009-01-01'
+LIST_WORKERS = 6
+
 # ==============================================
 
 
@@ -125,8 +130,30 @@ def stage1_manifest_path(stock_code: str) -> str:
 
 
 def enhanced_csv_path(stock_code: str) -> str:
-    """Stage 3 整合后的最终 CSV"""
+    """Stage 3 整合后的最终 CSV（incremental 模式）"""
     return os.path.join(EXPORT_DIR, f'{stock_code}_enhanced.csv')
+
+
+def full_posts_csv_path(stock_code: str) -> str:
+    """Stage 1 full 模式爬取的全量帖子 CSV"""
+    return os.path.join(TEMP_DIR, f'{stock_code}_full_posts.csv')
+
+
+def full_manifest_path(stock_code: str) -> str:
+    """Stage 1 full 模式产物清单"""
+    return os.path.join(TEMP_DIR, f'{stock_code}_full_manifest.json')
+
+
+def full_output_csv_path(stock_code: str, start_date: str) -> str:
+    """Stage 3 full 模式最终输出 CSV"""
+    date_suffix = start_date.replace('-', '')
+    return os.path.join(EXPORT_DIR, f'{stock_code}_full_{date_suffix}.csv')
+
+
+def full_data_output_csv_path(stock_code: str, start_date: str) -> str:
+    """Stage 3 full 模式复制到 data/ 目录的 CSV"""
+    date_suffix = start_date.replace('-', '')
+    return os.path.join(DATA_OUTPUT_DIR, f'{stock_code}_full_{date_suffix}.csv')
 
 
 def comment_csv_path(stock_code: str) -> str:
@@ -346,6 +373,88 @@ def crawl_post_list(stock_code: str, existing_ids: set, stop_date: str):
     print(f'  ✓ 新帖子已追加到 CSV，新增 {new_count[0]} 条，过滤重复 {skip_count[0]} 条')
 
 
+def make_full_storage_callback(stock_code: str):
+    """full 模式专用 CSV 写入回调，直接写 {stock}_full_posts.csv"""
+    full_csv = full_posts_csv_path(stock_code)
+    header_written = os.path.exists(full_csv) and os.path.getsize(full_csv) > 0
+    new_count = [0]
+
+    def storage_callback(dic_list):
+        rows = []
+        for dic in dic_list:
+            pid = str(dic.get('_id', ''))
+            if not pid:
+                continue
+            post_date = dic.get('post_date', '')
+            post_time = dic.get('post_time', '')
+            publish_time = f"{post_date} {post_time}".strip() if post_time else post_date
+            rows.append({
+                'user_id': dic.get('user_id', ''),
+                'post_id': pid,
+                'post_source_id': dic.get('post_source_id', ''),
+                'post_type': dic.get('post_type', ''),
+                'user_name': dic.get('post_author', ''),
+                'post_publish_time': publish_time,
+                'stockbar_name': dic.get('stockbar_name', ''),
+                'stockbar_code': dic.get('stockbar_code', stock_code),
+                'forward': dic.get('forward', '0'),
+                'coment_count': dic.get('comment_num', 0),
+                'click_count': dic.get('post_view', 0),
+                'post_title': dic.get('post_title', ''),
+                'url': dic.get('post_url', ''),
+                'content': dic.get('post_content', ''),
+            })
+        if not rows:
+            return
+        nonlocal header_written
+        mode = 'a' if header_written else 'w'
+        with open(full_csv, mode, newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+            if not header_written:
+                writer.writeheader()
+                header_written = True
+            writer.writerows(rows)
+        new_count[0] += len(rows)
+
+    return storage_callback, new_count
+
+
+def write_full_manifest(stock_code: str, start_date: str, summary: dict):
+    """写入 full 模式 manifest，供 Stage 2/3 校验。"""
+    manifest = {
+        "stock": stock_code,
+        "crawl_mode": "full",
+        "start_date": start_date,
+        "full_posts_csv": full_posts_csv_path(stock_code),
+        "max_page": summary.get('max_page', 0),
+        "boundary_page": summary.get('boundary_page', 0),
+        "completed_pages": summary.get('completed_pages', 0),
+        "failed_pages": summary.get('failed_pages', []),
+        "rows": summary.get('rows', 0),
+        "unique_post_ids": summary.get('unique_post_ids', 0),
+        "min_time": summary.get('min_time', ''),
+        "max_time": summary.get('max_time', ''),
+        "created_at": datetime.now().isoformat(),
+    }
+    path = full_manifest_path(stock_code)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def read_full_manifest(stock_code: str) -> dict | None:
+    path = full_manifest_path(stock_code)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
 def write_stage1_manifest(
     stock_code: str,
     source_csv: str | None,
@@ -425,6 +534,9 @@ def validate_stage1_inputs(stock_code: str, source_dirs: list | None, force_refr
 
 
 def run_stage1(source_dirs: list = None, force_refresh_base: bool = False):
+    if CRAWL_MODE == 'full':
+        return run_stage1_full(start_date=START_DATE, list_workers=LIST_WORKERS)
+
     print(f'\n{"="*60}')
     print(f'[Stage 1] {STOCK_CODE} 提取 CSV + 爬取帖子列表')
     print(f'{"="*60}')
@@ -495,6 +607,50 @@ def run_stage1(source_dirs: list = None, force_refresh_base: bool = False):
     set_flag('stage1')
     print(f'\n{"="*60}')
     print(f'[Stage 1] 完成！请在新 PowerShell 窗口运行 Stage 2')
+    print(f'{"="*60}')
+    return True
+
+
+def run_stage1_full(start_date: str, list_workers: int):
+    """full 模式 Stage 1：从网页全量抓取 start_date 之后的帖子列表。"""
+    print(f'\n{"="*60}')
+    print(f'[Stage 1 full] {STOCK_CODE} 全量爬取帖子列表（start_date={start_date}）')
+    print(f'{"="*60}')
+
+    if not check_disk_space(min_gb=1.0):
+        return False
+
+    ensure_dirs()
+
+    # 开始前清空旧 full_posts.csv，避免把上一次运行结果重复计入
+    full_csv = full_posts_csv_path(STOCK_CODE)
+    if os.path.exists(full_csv):
+        os.remove(full_csv)
+        print(f'  已清空旧 full_posts CSV: {full_csv}')
+
+    callback, new_count = make_full_storage_callback(STOCK_CODE)
+    post_crawler = PostCrawler(STOCK_CODE)
+    summary = post_crawler.crawl_post_info_since(
+        start_date=start_date,
+        storage_callback=callback,
+        list_workers=list_workers,
+    )
+    print(f'  ✓ 全量帖子已写入 CSV: {full_csv}')
+    print(f'    总页数={summary.get("max_page")}, 边界页={summary.get("boundary_page")}, '
+          f'完成页={summary.get("completed_pages")}, 失败页={summary.get("failed_pages")}, '
+          f'行数={summary.get("rows")}, 唯一ID={summary.get("unique_post_ids")}, '
+          f'时间范围={summary.get("min_time")} ~ {summary.get("max_time")}')
+
+    if summary.get('failed_pages'):
+        print(f'[错误] Stage 1 full 存在失败页面: {summary["failed_pages"]}')
+        return False
+
+    write_full_manifest(STOCK_CODE, start_date, summary)
+    print(f'  ✓ full manifest 已写入: {full_manifest_path(STOCK_CODE)}')
+
+    set_flag('stage1')
+    print(f'\n{"="*60}')
+    print(f'[Stage 1 full] 完成！请在新 PowerShell 窗口运行 Stage 2')
     print(f'{"="*60}')
     return True
 
@@ -823,6 +979,9 @@ def _flush_updates_to_csv(csv_paths: list, updates: dict):
 
 
 def run_stage2(detail_workers: int = 3):
+    if CRAWL_MODE == 'full':
+        return run_stage2_full(detail_workers=detail_workers)
+
     print(f'\n{"="*60}')
     print(f'[Stage 2] {STOCK_CODE} 正文补爬')
     print(f'{"="*60}')
@@ -851,6 +1010,39 @@ def run_stage2(detail_workers: int = 3):
     set_flag('stage2')
     print(f'\n{"="*60}')
     print(f'[Stage 2] 完成！请在新 PowerShell 窗口运行 Stage 3')
+    print(f'{"="*60}')
+    return True
+
+
+def run_stage2_full(detail_workers: int = 3):
+    """full 模式 Stage 2：只对 full_posts.csv 补爬正文。"""
+    print(f'\n{"="*60}')
+    print(f'[Stage 2 full] {STOCK_CODE} 正文补爬')
+    print(f'{"="*60}')
+
+    if not check_flag('stage1'):
+        print('[错误] Stage 1 未完成，请先运行 Stage 1')
+        return False
+
+    manifest = read_full_manifest(STOCK_CODE)
+    if not manifest:
+        print(f'[错误] 未找到 full manifest: {full_manifest_path(STOCK_CODE)}')
+        return False
+
+    full_csv = full_posts_csv_path(STOCK_CODE)
+    if not os.path.exists(full_csv):
+        print(f'[错误] full_posts CSV 不存在: {full_csv}')
+        return False
+
+    actual_rows = _count_csv_rows(full_csv)
+    if actual_rows != manifest.get('rows', 0):
+        print(f'[警告] full_posts 行数与 manifest 不符: manifest={manifest.get("rows")}, actual={actual_rows}')
+
+    crawl_post_detail_csv(STOCK_CODE, [full_csv], detail_workers=detail_workers)
+
+    set_flag('stage2')
+    print(f'\n{"="*60}')
+    print(f'[Stage 2 full] 完成！请在新 PowerShell 窗口运行 Stage 3')
     print(f'{"="*60}')
     return True
 
@@ -954,6 +1146,84 @@ def merge_csv_files(stock_code: str, require_manifest: bool = True) -> str | Non
     last_ts = all_rows[-1].get('post_publish_time', '?') if all_rows else '?'
     print(f'  ✓ 整合完成: {total} 条记录 ({file_size:.1f} MB)，时间范围 {first_ts} ~ {last_ts} → {out_csv}')
     print(f'    base_rows={row_counts.get("基础数据", 0)}, new_rows={row_counts.get("新帖子", 0)}')
+    return out_csv
+
+
+def export_full_posts(stock_code: str, start_date: str) -> str | None:
+    """full 模式 Stage 3：校验并导出 full_posts.csv 到 temp_export/。
+
+    校验项：
+      - full manifest 必须存在
+      - full_posts.csv 行数与 manifest 一致
+      - post_publish_time 最小日期 >= start_date
+      - post_id 无重复
+      - failed_pages 为空
+    """
+    print(f'\n[Stage 3-1 full] 校验并导出全量帖子（start_date={start_date}）...')
+    full_csv = full_posts_csv_path(stock_code)
+    out_csv = full_output_csv_path(stock_code, start_date)
+
+    manifest = read_full_manifest(stock_code)
+    if not manifest:
+        print(f'  [错误] 未找到 full manifest: {full_manifest_path(stock_code)}')
+        return None
+
+    if manifest.get('crawl_mode') != 'full':
+        print(f'  [错误] manifest crawl_mode 不是 full: {manifest.get("crawl_mode")}')
+        return None
+
+    if manifest.get('failed_pages'):
+        print(f'  [错误] Stage 1 full 存在失败页面: {manifest["failed_pages"]}')
+        return None
+
+    if not os.path.exists(full_csv):
+        print(f'  [错误] full_posts CSV 不存在: {full_csv}')
+        return None
+
+    expected_rows = manifest.get('rows', 0)
+    actual_rows = _count_csv_rows(full_csv)
+    if actual_rows != expected_rows:
+        print(f'  [错误] full_posts 行数与 manifest 不符: manifest={expected_rows}, actual={actual_rows}')
+        return None
+
+    all_rows = []
+    seen_ids = set()
+    duplicate_ids = []
+    min_time = None
+    with open(full_csv, 'r', encoding='utf-8') as f_in:
+        reader = csv.DictReader(f_in)
+        for row in reader:
+            pid = str(row.get('post_id', ''))
+            if pid:
+                if pid in seen_ids:
+                    duplicate_ids.append(pid)
+                seen_ids.add(pid)
+            ts = row.get('post_publish_time', '').strip()
+            if ts:
+                if min_time is None or ts < min_time:
+                    min_time = ts
+            all_rows.append(row)
+
+    if duplicate_ids:
+        print(f'  [错误] full_posts 中存在重复 post_id: {duplicate_ids[:10]}...')
+        return None
+
+    if min_time and min_time[:10] < start_date:
+        print(f'  [错误] full_posts 最小日期 {min_time[:10]} 早于 start_date {start_date}')
+        return None
+
+    # 按时间降序排列
+    all_rows.sort(key=lambda r: r.get('post_publish_time', '').strip(), reverse=True)
+
+    with open(out_csv, 'w', newline='', encoding='utf-8') as f_out:
+        writer = csv.DictWriter(f_out, fieldnames=CSV_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(all_rows)
+
+    file_size = os.path.getsize(out_csv) / 1024 / 1024
+    first_ts = all_rows[0].get('post_publish_time', '?') if all_rows else '?'
+    last_ts = all_rows[-1].get('post_publish_time', '?') if all_rows else '?'
+    print(f'  ✓ 导出完成: {actual_rows} 条记录 ({file_size:.1f} MB)，时间范围 {first_ts} ~ {last_ts} → {out_csv}')
     return out_csv
 
 
@@ -1098,6 +1368,9 @@ def cleanup_all(stock_code: str):
 
 
 def run_stage3():
+    if CRAWL_MODE == 'full':
+        return run_stage3_full(start_date=START_DATE)
+
     print(f'\n{"="*60}')
     print(f'[Stage 3] {STOCK_CODE} 整合、上传与清理')
     print(f'{"="*60}')
@@ -1144,23 +1417,73 @@ def run_stage3():
     return True
 
 
+def run_stage3_full(start_date: str):
+    """full 模式 Stage 3：校验并导出 full_posts.csv。"""
+    print(f'\n{"="*60}')
+    print(f'[Stage 3 full] {STOCK_CODE} 校验导出')
+    print(f'{"="*60}')
+
+    if not check_flag('stage2'):
+        print('[错误] Stage 2 未完成，请先运行 Stage 2')
+        return False
+
+    if not check_disk_space(min_gb=0.2):
+        return False
+
+    post_csv = export_full_posts(STOCK_CODE, start_date)
+    if not post_csv:
+        print('[错误] Stage 3 full 导出失败，已中止')
+        return False
+
+    if SKIP_BAIDU_UPLOAD:
+        os.makedirs(DATA_OUTPUT_DIR, exist_ok=True)
+        dst = full_data_output_csv_path(STOCK_CODE, start_date)
+        shutil.copy2(post_csv, dst)
+        size_mb = os.path.getsize(dst) / 1024 / 1024
+        print(f'  ✓ [帖子] 已复制到: {dst} ({size_mb:.1f} MB)')
+        print(f'\n[Stage 3 full] 跳过上传和清理（SKIP_BAIDU_UPLOAD=True），文件已保存至 data/ 目录')
+    else:
+        if not upload_to_baidu(STOCK_CODE, post_csv):
+            print('上传失败，保留本地数据以便手动处理')
+            return False
+        cleanup_all(STOCK_CODE)
+        clear_flags()
+
+    print(f'\n{"="*60}')
+    print(f'[Stage 3 full] 全部完成！')
+    if not SKIP_BAIDU_UPLOAD:
+        print(f'  数据已上传至: {BAIDU_REMOTE_DIR}/{STOCK_CODE}/')
+        print(f'  本地数据已清理，可以开始处理下一只股票')
+    print(f'{"="*60}')
+    return True
+
+
 # ==================== 主入口 ====================
 
 def main():
-    global STOCK_CODE
+    global STOCK_CODE, CRAWL_MODE, START_DATE, LIST_WORKERS
     parser = argparse.ArgumentParser(description='000001 自动化数据流水线 (CSV-Native 高速版)')
     parser.add_argument('--stock', default=STOCK_CODE,
                         help='股票代码，默认 000001；可传 1/000001/600000 等格式')
     parser.add_argument('--stage', type=int, choices=[1, 2, 3], required=True,
                         help='运行阶段: 1=提取+列表爬取, 2=正文爬取, 3=整合上传清理')
+    parser.add_argument('--crawl-mode', choices=['incremental', 'full'], default='incremental',
+                        help='爬取模式: incremental=历史CSV+增量补爬, full=从start_date全量爬取(默认incremental)')
+    parser.add_argument('--start-date', default='2009-01-01',
+                        help='full 模式起始日期（YYYY-MM-DD），默认 2009-01-01')
+    parser.add_argument('--list-workers', type=int, default=6,
+                        help='full 模式 Stage 1 列表页并发数，默认 6')
     parser.add_argument('--detail-workers', type=int, default=3,
                         help='Stage 2 财富号正文 requests 并发数，默认 3。设为 1 回退单线程')
     parser.add_argument('--source-dir', action='append', default=[],
-                        help='Stage 1 历史 CSV 目录，可重复传入；优先查找 {stock}.csv')
+                        help='Stage 1 incremental 历史 CSV 目录，可重复传入；full 模式不需要')
     parser.add_argument('--force-refresh-base', action='store_true',
                         help='Stage 1 强制从 --source-dir 重新复制最新历史 CSV，忽略 temp_extract 中已存在的 base')
     args = parser.parse_args()
     STOCK_CODE = str(args.stock).strip().zfill(6)
+    CRAWL_MODE = args.crawl_mode
+    START_DATE = args.start_date
+    LIST_WORKERS = args.list_workers
 
     if args.stage == 1:
         ok = run_stage1(source_dirs=args.source_dir, force_refresh_base=args.force_refresh_base)

@@ -704,7 +704,191 @@ class PostCrawler(object):
                 f.result()
 
         print(f'{self.symbol}: 股吧原生帖子 {num_workers} worker 并发完成，'
-              f'共 {total} 条（成功 {total - progress["empty"]}，空 {progress["empty"]}，错误 {progress["errors"]}）')
+              f'共 {total} 条（成功 {total - progress["empty"]}，空 {progress["empty"]}，错误 {progress["errors"]})')
+
+    # ==================== 全量列表抓取（按 start_date 边界） ====================
+
+    def _page_date_range(self, page_num: int) -> tuple[str | None, str | None, int]:
+        """返回某页的 (max_date, min_date, row_count)。
+
+        用于快速判断该页是否可能包含 >= start_date 的帖子。
+        """
+        try:
+            dic_list = self._fetch_post_page_fast(page_num)
+        except Exception:
+            return None, None, 0
+        dates = [d.get('post_date') for d in dic_list if d.get('post_date')]
+        if not dates:
+            return None, None, len(dic_list)
+        return max(dates), min(dates), len(dic_list)
+
+    def _find_boundary_page_since(self, start_date: str, max_page: int) -> int:
+        """二分查找最后一个可能包含 post_date >= start_date 的页面。
+
+        列表页按时间倒序：第 1 页最新，第 max_page 页最旧。
+        因此如果第 mid 页的 min_date >= start_date，说明 mid 及之后（页号更大）可能还有目标帖；
+        如果第 mid 页的 max_date < start_date，说明 mid 之前（页号更小）才可能有目标帖。
+        """
+        left, right = 1, max_page
+        boundary = max_page
+        probes = 0
+        max_probes = 30
+        while left <= right and probes < max_probes:
+            mid = (left + right) // 2
+            max_date, min_date, count = self._page_date_range(mid)
+            probes += 1
+            if max_date is None or count == 0:
+                # 页面异常，收缩右边界再试
+                right = mid - 1
+                continue
+            if min_date >= start_date:
+                # mid 整页都在 start_date 之后，后面页号更大也可能有
+                boundary = max(boundary, mid)
+                left = mid + 1
+            elif max_date < start_date:
+                # mid 整页都在 start_date 之前，目标只可能在前半段
+                right = mid - 1
+            else:
+                # mid 页跨边界，它就是目标页之一
+                boundary = max(boundary, mid)
+                # 为了找更晚的边界页，继续向后探测
+                left = mid + 1
+        print(f'{self.symbol}: 二分探测 {probes} 次，边界页约为 {boundary}')
+        return boundary
+
+    def _fetch_page_with_retry(
+        self,
+        page_num: int,
+        retries: int = 3,
+        base_delay: float = 1.0,
+    ) -> list:
+        """带指数退避的页面抓取，requests 失败时回退 Selenium。"""
+        last_error = None
+        for attempt in range(retries + 1):
+            try:
+                return self._fetch_post_page_fast(page_num)
+            except Exception as e:
+                last_error = e
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                time.sleep(delay)
+                # 如果是验证页，额外长冷却一次
+                if 'fd_guba_validate' in str(e) or '身份核实' in str(e):
+                    print(f'{self.symbol}: 第 {page_num} 页触发验证，暂停 60 秒')
+                    time.sleep(60)
+        print(f'{self.symbol}: 第 {page_num} 页 requests 连续失败 {retries + 1} 次，回退 Selenium: {last_error}')
+        try:
+            parser = PostParser()
+            return self.fetch_post_page(page_num, parser, stockbar_name=f'{self.symbol}吧')
+        except Exception as e:
+            raise RuntimeError(f'page {page_num} failed after requests and selenium fallback: {e}')
+
+    def crawl_post_info_since(
+        self,
+        start_date: str,
+        storage_callback,
+        list_workers: int = 6,
+        checkpoint_callback=None,
+    ) -> dict:
+        """从网页全量抓取 post_publish_time >= start_date 的帖子列表。
+
+        Args:
+            start_date: 起始日期（YYYY-MM-DD），包含该日期。
+            storage_callback: 每页数据回调，接收 dic_list（已按 start_date 过滤）。
+            list_workers: 并发抓取页数。
+            checkpoint_callback: 可选回调，每处理完一页调用一次，参数为 (page_num, result)。
+
+        Returns:
+            汇总信息 dict，包含 max_page, boundary_page, completed_pages, failed_pages,
+            rows, unique_post_ids, min_time, max_time 等。
+        """
+        print(f'\n{self.symbol}: 开始全量爬取列表，start_date={start_date}')
+        max_page = self.get_page_num()
+        print(f'{self.symbol}: 列表总页数 {max_page}')
+
+        boundary_page = self._find_boundary_page_since(start_date, max_page)
+        print(f'{self.symbol}: 需抓取 1 ~ {boundary_page} 页')
+
+        completed_pages = 0
+        failed_pages: list[int] = []
+        total_rows = 0
+        seen_ids: set[str] = set()
+        min_time = None
+        max_time = None
+
+        def _process_page(page_num: int) -> tuple[int, list]:
+            try:
+                time.sleep(abs(random.normalvariate(0.05, 0.03)))
+                dic_list = self._fetch_page_with_retry(page_num)
+                # 只保留 >= start_date 的帖子
+                kept = [d for d in dic_list if d.get('post_date') and d['post_date'] >= start_date]
+                # 停止条件：整页都 < start_date（说明已经越过边界）
+                all_before = dic_list and all(d.get('post_date', '') < start_date for d in dic_list if d.get('post_date'))
+                return page_num, kept, all_before
+            except Exception as e:
+                print(f'{self.symbol}: 第 {page_num} 页处理失败: {e}')
+                return page_num, [], False
+
+        # 按 chunk 并发：每批最多 300 页，避免一次性塞爆线程池和内存
+        CHUNK_SIZE = 300
+        pages = list(range(1, boundary_page + 1))
+        chunk_idx = 0
+        for i in range(0, len(pages), CHUNK_SIZE):
+            chunk = pages[i:i + CHUNK_SIZE]
+            chunk_idx += 1
+            print(f'{self.symbol}: 并发抓取第 {chunk_idx} 批，页面 {chunk[0]}~{chunk[-1]}')
+            results = []
+            with ThreadPoolExecutor(max_workers=list_workers) as executor:
+                futures = {executor.submit(_process_page, p): p for p in chunk}
+                for future in as_completed(futures):
+                    page_num, kept, all_before = future.result()
+                    if not kept and not all_before and page_num <= boundary_page:
+                        # 既没有保留数据也不是正常越过边界，计入失败
+                        failed_pages.append(page_num)
+                    else:
+                        failed_pages = [p for p in failed_pages if p != page_num]
+                        if kept:
+                            # 去重并统计
+                            unique_kept = []
+                            for d in kept:
+                                pid = str(d.get('_id', ''))
+                                if pid and pid not in seen_ids:
+                                    seen_ids.add(pid)
+                                    unique_kept.append(d)
+                            if unique_kept:
+                                storage_callback(unique_kept)
+                                total_rows += len(unique_kept)
+                                dates = [d['post_date'] for d in unique_kept if d.get('post_date')]
+                                times = [f"{d['post_date']} {d.get('post_time', '')}".strip() for d in unique_kept]
+                                if dates:
+                                    local_min = min(dates)
+                                    local_max = max(dates)
+                                    if min_time is None or local_min < min_time:
+                                        min_time = local_min
+                                    if max_time is None or local_max > max_time:
+                                        max_time = local_max
+                        completed_pages += 1
+                        if checkpoint_callback:
+                            checkpoint_callback(page_num, {"kept": len(kept), "all_before": all_before})
+                    if all_before:
+                        print(f'{self.symbol}: 第 {page_num} 页全部 < {start_date}，提前结束')
+                        break
+            print(f'{self.symbol}: 第 {chunk_idx} 批完成，累计 {completed_pages} 页，{total_rows} 条')
+
+        end = time.time()
+        time_cost = end - self.start
+        summary = {
+            'max_page': max_page,
+            'boundary_page': boundary_page,
+            'completed_pages': completed_pages,
+            'failed_pages': sorted(set(failed_pages)),
+            'rows': total_rows,
+            'unique_post_ids': len(seen_ids),
+            'min_time': min_time or '',
+            'max_time': max_time or '',
+            'time_cost_seconds': round(time_cost, 2),
+        }
+        print(f'{self.symbol}: 全量列表爬取完成，{summary}')
+        return summary
 
 
 class CommentCrawler(object):

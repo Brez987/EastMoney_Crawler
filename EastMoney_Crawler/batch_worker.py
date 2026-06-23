@@ -27,6 +27,7 @@ from typing import Iterable
 PROJECT_DIR = Path(__file__).resolve().parent
 AUTO_PIPELINE = PROJECT_DIR / "auto_pipeline_000001.py"
 DEFAULT_PROGRESS_DIR = PROJECT_DIR / "batch_progress"
+DEFAULT_PROGRESS_FULL_DIR = PROJECT_DIR / "batch_progress_full_20090101"
 DEFAULT_LOG_DIR = PROJECT_DIR / "batch_logs"
 DEFAULT_DATA_DIR = PROJECT_DIR / "data"
 DEFAULT_TEMP_DIR = PROJECT_DIR / "temp_extract"
@@ -108,17 +109,38 @@ def discover_stock_csvs(source_dirs: list[Path]) -> dict[str, Path]:
     return dict(sorted(stocks.items()))
 
 
-def filter_stocks(stocks: dict[str, Path], requested: list[str] | None) -> dict[str, Path]:
+def load_stock_list(path: Path) -> dict[str, Path | None]:
+    """从单列股票代码清单加载任务。
+
+    每行一个代码，支持空行和以 # 开头的注释行。
+    返回有序 dict: {stock_code: source_csv_or_None}。
+    full 模式下 source_csv 为 None，不需要历史 CSV。
+    """
+    stocks: dict[str, Path | None] = {}
+    if not path.exists():
+        return stocks
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            code = normalize_stock(line)
+            if code and code not in stocks:
+                stocks[code] = None
+    return stocks
+
+
+def filter_stocks(stocks: dict[str, Path | None], requested: list[str] | None) -> dict[str, Path | None]:
     if not requested:
         return stocks
-    filtered: dict[str, Path] = {}
+    filtered: dict[str, Path | None] = {}
     for stock in requested:
         normalized = normalize_stock(stock)
         if normalized in stocks:
             filtered[normalized] = stocks[normalized]
         else:
-            filtered[normalized] = PROJECT_DIR / f"{normalized}.csv"
-    return dict(sorted(filtered.items()))
+            filtered[normalized] = None
+    return filtered
 
 
 def validate_source_csv(csv_path: Path) -> tuple[bool, str]:
@@ -189,7 +211,7 @@ def remove_state(progress_dir: Path, stock: str, suffix: str) -> None:
 
 def claim_stock(
     stock: str,
-    source_csv: Path,
+    source_csv: Path | None,
     progress_dir: Path,
     worker_id: str,
     stale_seconds: float,
@@ -213,13 +235,14 @@ def claim_stock(
             print(f"[{worker_id}] cannot reclaim lock {stock}: {exc}")
             return None
 
-    payload = {
+    payload: dict = {
         "stock": stock,
-        "source_csv": str(source_csv),
         "worker_id": worker_id,
         "pid": os.getpid(),
         "created_at": now_iso(),
     }
+    if source_csv is not None:
+        payload["source_csv"] = str(source_csv)
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
     try:
         fd = os.open(str(lock_path), flags)
@@ -229,7 +252,7 @@ def claim_stock(
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
         handle.write("\n")
-    return ClaimedStock(stock=stock, source_csv=source_csv, lock_path=lock_path)
+    return ClaimedStock(stock=stock, source_csv=source_csv or Path(), lock_path=lock_path)
 
 
 def heartbeat(lock_path: Path, stop_event: threading.Event, interval: float) -> None:
@@ -264,22 +287,33 @@ def detail_failed_count(stock: str) -> int:
         return sum(1 for line in handle if line.strip())
 
 
-def clean_per_stock_temp(stock: str) -> None:
+def clean_per_stock_temp(stock: str, crawl_mode: str = "incremental") -> None:
     """处理某只股票前清理该股票的旧临时产物，避免过期 base/new 被复用。"""
     patterns = [
         DEFAULT_TEMP_DIR / f"{stock}_base.csv",
         DEFAULT_TEMP_DIR / f"{stock}_new_posts.csv",
+        DEFAULT_TEMP_DIR / f"{stock}_full_posts.csv",
         DEFAULT_TEMP_DIR / f"{stock}_stage1_manifest.json",
+        DEFAULT_TEMP_DIR / f"{stock}_full_manifest.json",
         DEFAULT_TEMP_DIR / f"{stock}_detail_failed.jsonl",
         DEFAULT_TEMP_DIR / f"{stock}_content_delta.jsonl",
         DEFAULT_TEMP_DIR / f"{stock}_detail_checkpoint.json",
         PROJECT_DIR / "temp_export" / f"{stock}_enhanced.csv",
+        PROJECT_DIR / "temp_export" / f"{stock}_full_20090101.csv",
         PROJECT_DIR / "temp_export" / f"{stock}_comments.csv",
         PROJECT_DIR / ".pipeline_flags" / f"{stock}_stage1.done",
         PROJECT_DIR / ".pipeline_flags" / f"{stock}_stage2.done",
-        PROJECT_DIR / "batch_progress" / f"{stock}.lock",
-        PROJECT_DIR / "batch_progress" / f"{stock}.retrying",
     ]
+    if crawl_mode == "incremental":
+        patterns.extend([
+            PROJECT_DIR / "batch_progress" / f"{stock}.lock",
+            PROJECT_DIR / "batch_progress" / f"{stock}.retrying",
+        ])
+    else:
+        patterns.extend([
+            PROJECT_DIR / "batch_progress_full_20090101" / f"{stock}.lock",
+            PROJECT_DIR / "batch_progress_full_20090101" / f"{stock}.retrying",
+        ])
     removed = []
     for path in patterns:
         try:
@@ -323,6 +357,9 @@ def build_stage_cmd(
     stage: int,
     source_dirs: list[Path],
     detail_workers: int,
+    crawl_mode: str = "incremental",
+    start_date: str = "2009-01-01",
+    list_workers: int = 6,
 ) -> list[str]:
     cmd = [
         python_bin,
@@ -331,8 +368,12 @@ def build_stage_cmd(
         stock,
         "--stage",
         str(stage),
+        "--crawl-mode",
+        crawl_mode,
     ]
-    if stage == 1:
+    if crawl_mode == "full":
+        cmd.extend(["--start-date", start_date, "--list-workers", str(list_workers)])
+    if stage == 1 and crawl_mode == "incremental":
         for source_dir in source_dirs:
             cmd.extend(["--source-dir", str(source_dir)])
     if stage == 2:
@@ -347,34 +388,61 @@ def classify_stage_failure(stage: int, result: StageResult) -> str:
     return f"stage{stage}_exit_{result.returncode}"
 
 
+def output_csv_size_mb(stock: str, crawl_mode: str = "incremental") -> float:
+    if crawl_mode == "full":
+        candidates = [
+            DEFAULT_DATA_DIR / f"{stock}_full_20090101.csv",
+            PROJECT_DIR / "temp_export" / f"{stock}_full_20090101.csv",
+        ]
+    else:
+        candidates = [
+            DEFAULT_DATA_DIR / f"{stock}_enhanced.csv",
+            PROJECT_DIR / "temp_export" / f"{stock}_enhanced.csv",
+        ]
+    for path in candidates:
+        if path.exists():
+            return round(path.stat().st_size / 1024 / 1024, 2)
+    return 0.0
+
+
 def run_stock_pipeline(
     stock: str,
-    source_csv: Path,
+    source_csv: Path | None,
     args: argparse.Namespace,
     source_dirs: list[Path],
 ) -> tuple[bool, dict, str]:
+    crawl_mode = getattr(args, "crawl_mode", "incremental")
+    start_date = getattr(args, "start_date", "2009-01-01")
+    list_workers = getattr(args, "list_workers", 6)
+
     summary = {
         "stock": stock,
         "worker_id": args.worker_id,
-        "source_csv": str(source_csv),
+        "crawl_mode": crawl_mode,
+        "source_csv": str(source_csv) if source_csv else "",
         "started_at": now_iso(),
         "stage1_seconds": 0.0,
         "stage2_seconds": 0.0,
         "stage3_seconds": 0.0,
         "total_seconds": 0.0,
-        "enhanced_csv_mb": 0.0,
+        "output_csv_mb": 0.0,
         "detail_failed_count": 0,
         "exit_code": 1,
         "attempts": 0,
     }
 
-    valid, reason = validate_source_csv(source_csv)
-    if not valid:
-        summary.update({"failed_reason": reason, "finished_at": now_iso()})
-        return False, summary, reason
+    if crawl_mode == "incremental":
+        if source_csv is None or not source_csv.exists():
+            reason = "missing_source_csv"
+            summary.update({"failed_reason": reason, "finished_at": now_iso()})
+            return False, summary, reason
+        valid, reason = validate_source_csv(source_csv)
+        if not valid:
+            summary.update({"failed_reason": reason, "finished_at": now_iso()})
+            return False, summary, reason
 
     # 每次尝试前都清理该股票的旧临时产物，保证 Stage 1 从干净状态开始
-    clean_per_stock_temp(stock)
+    clean_per_stock_temp(stock, crawl_mode=crawl_mode)
 
     total_started = time.time()
     final_reason = ""
@@ -404,6 +472,9 @@ def run_stock_pipeline(
                     stage,
                     source_dirs=source_dirs,
                     detail_workers=args.detail_workers,
+                    crawl_mode=crawl_mode,
+                    start_date=start_date,
+                    list_workers=list_workers,
                 ),
                 stage=stage,
                 stock=stock,
@@ -421,7 +492,7 @@ def run_stock_pipeline(
             summary.update(
                 {
                     "total_seconds": round(time.time() - total_started, 2),
-                    "enhanced_csv_mb": output_csv_size_mb(stock),
+                    "output_csv_mb": output_csv_size_mb(stock, crawl_mode=crawl_mode),
                     "detail_failed_count": detail_failed_count(stock),
                     "exit_code": 0,
                     "finished_at": now_iso(),
@@ -434,7 +505,7 @@ def run_stock_pipeline(
             summary.update(
                 {
                     "total_seconds": round(time.time() - total_started, 2),
-                    "enhanced_csv_mb": output_csv_size_mb(stock),
+                    "output_csv_mb": output_csv_size_mb(stock, crawl_mode=crawl_mode),
                     "detail_failed_count": detail_failed_count(stock),
                     "exit_code": failed_result.returncode if failed_result else 1,
                     "failed_reason": final_reason,
@@ -451,7 +522,7 @@ def run_stock_pipeline(
     summary.update(
         {
             "total_seconds": round(time.time() - total_started, 2),
-            "enhanced_csv_mb": output_csv_size_mb(stock),
+            "output_csv_mb": output_csv_size_mb(stock, crawl_mode=crawl_mode),
             "detail_failed_count": detail_failed_count(stock),
             "exit_code": 1,
             "failed_reason": final_reason,
@@ -523,7 +594,7 @@ def process_claim(claim: ClaimedStock, args: argparse.Namespace, source_dirs: li
 
 
 def find_next_claim(
-    stocks: dict[str, Path],
+    stocks: dict[str, Path | None],
     args: argparse.Namespace,
 ) -> ClaimedStock | None:
     stale_seconds = args.stale_lock_hours * 3600
@@ -541,17 +612,17 @@ def find_next_claim(
     return None
 
 
-def run_dry_run(stocks: dict[str, Path], limit: int | None) -> int:
+def run_dry_run(stocks: dict[str, Path | None], limit: int | None) -> int:
     items = list(stocks.items())
     if limit is not None:
         items = items[:limit]
     print(f"[dry-run] will process {len(items)} stock(s)")
     for stock, source_csv in items:
-        print(f"[dry-run] {stock} <- {source_csv}")
+        print(f"[dry-run] {stock} <- {source_csv or '(no source CSV required)'}")
     return 0
 
 
-def worker_loop(args: argparse.Namespace, stocks: dict[str, Path], source_dirs: list[Path]) -> int:
+def worker_loop(args: argparse.Namespace, stocks: dict[str, Path | None], source_dirs: list[Path]) -> int:
     args.progress_dir.mkdir(parents=True, exist_ok=True)
     processed = 0
     successes = 0
@@ -589,8 +660,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Batch worker for EastMoney CSV pipeline")
     parser.add_argument("--worker-id", default=f"worker_{os.getpid()}")
     parser.add_argument("--source-dir", action="append", default=[],
-                        help="Directory containing stock CSV files; may be provided multiple times")
-    parser.add_argument("--progress-dir", type=Path, default=DEFAULT_PROGRESS_DIR)
+                        help="Directory containing stock CSV files; may be provided multiple times (incremental mode only)")
+    parser.add_argument("--stock-list", type=Path, default=None,
+                        help="Path to a single-column stock code list file (full mode)")
+    parser.add_argument("--crawl-mode", choices=["incremental", "full"], default="incremental",
+                        help="Crawl mode: incremental uses historical CSVs, full crawls from start-date on the web")
+    parser.add_argument("--start-date", default="2009-01-01",
+                        help="Full mode start date (YYYY-MM-DD)")
+    parser.add_argument("--list-workers", type=int, default=6,
+                        help="Full mode Stage 1 list page concurrency")
+    parser.add_argument("--progress-dir", type=Path, default=None)
     parser.add_argument("--detail-workers", type=int, default=3)
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--stale-lock-hours", type=float, default=3.0)
@@ -610,25 +689,46 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.progress_dir is None:
+        args.progress_dir = (
+            DEFAULT_PROGRESS_FULL_DIR
+            if args.crawl_mode == "full"
+            else DEFAULT_PROGRESS_DIR
+        )
     args.progress_dir = args.progress_dir.expanduser().resolve()
 
-    source_dirs = collect_source_dirs(args.source_dir)
-    if not source_dirs:
-        print("[error] no source directories found")
-        return 1
+    if args.crawl_mode == "full":
+        if args.stock_list is None:
+            default_list = PROJECT_DIR / "数据_list.csv"
+            if default_list.exists():
+                args.stock_list = default_list
+            else:
+                print("[error] full mode requires --stock-list or 数据_list.csv in project dir")
+                return 1
+        stocks = load_stock_list(args.stock_list)
+        stocks = filter_stocks(stocks, args.stock)
+        source_dirs: list[Path] = []
+    else:
+        source_dirs = collect_source_dirs(args.source_dir)
+        if not source_dirs:
+            print("[error] no source directories found")
+            return 1
+        stocks = discover_stock_csvs(source_dirs)
+        stocks = filter_stocks(stocks, args.stock)
 
-    stocks = discover_stock_csvs(source_dirs)
-    stocks = filter_stocks(stocks, args.stock)
     if args.limit is not None:
         stocks = dict(list(stocks.items())[:args.limit])
 
     if not stocks:
-        print("[error] no stock CSV files discovered")
+        print("[error] no stock tasks discovered")
         return 1
 
-    print(f"[{args.worker_id}] source dirs:")
-    for source_dir in source_dirs:
-        print(f"  - {source_dir}")
+    print(f"[{args.worker_id}] mode: {args.crawl_mode}")
+    if args.crawl_mode == "incremental":
+        print(f"[{args.worker_id}] source dirs:")
+        for source_dir in source_dirs:
+            print(f"  - {source_dir}")
     print(f"[{args.worker_id}] discovered {len(stocks)} stock(s)")
 
     if args.dry_run:
