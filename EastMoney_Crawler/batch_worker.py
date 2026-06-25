@@ -360,6 +360,8 @@ def build_stage_cmd(
     crawl_mode: str = "incremental",
     start_date: str = "2009-01-01",
     list_workers: int = 6,
+    list_source: str = "html",
+    list_page_limit: int = 0,
 ) -> list[str]:
     cmd = [
         python_bin,
@@ -372,7 +374,13 @@ def build_stage_cmd(
         crawl_mode,
     ]
     if crawl_mode == "full":
-        cmd.extend(["--start-date", start_date, "--list-workers", str(list_workers)])
+        cmd.extend([
+            "--start-date", start_date,
+            "--list-workers", str(list_workers),
+            "--list-source", list_source,
+        ])
+        if list_page_limit:
+            cmd.extend(["--list-page-limit", str(list_page_limit)])
     if stage == 1 and crawl_mode == "incremental":
         for source_dir in source_dirs:
             cmd.extend(["--source-dir", str(source_dir)])
@@ -414,6 +422,7 @@ def run_stock_pipeline(
     crawl_mode = getattr(args, "crawl_mode", "incremental")
     start_date = getattr(args, "start_date", "2009-01-01")
     list_workers = getattr(args, "list_workers", 6)
+    list_page_limit = getattr(args, "list_page_limit", 0)
 
     summary = {
         "stock": stock,
@@ -475,6 +484,8 @@ def run_stock_pipeline(
                     crawl_mode=crawl_mode,
                     start_date=start_date,
                     list_workers=list_workers,
+                    list_source=getattr(args, "list_source", "html"),
+                    list_page_limit=list_page_limit,
                 ),
                 stage=stage,
                 stock=stock,
@@ -668,7 +679,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-date", default="2009-01-01",
                         help="Full mode start date (YYYY-MM-DD)")
     parser.add_argument("--list-workers", type=int, default=6,
-                        help="Full mode Stage 1 list page concurrency")
+                        help="Full mode Stage 1 list-page requests workers")
+    parser.add_argument("--list-source", choices=["html", "api", "auto", "selenium"], default="html",
+                        help="Full mode Stage 1 list source; html/api/auto use fast requests HTML")
+    parser.add_argument("--list-page-limit", type=int, default=0,
+                        help="Full mode trial page limit; 0 means no limit")
     parser.add_argument("--progress-dir", type=Path, default=None)
     parser.add_argument("--detail-workers", type=int, default=3)
     parser.add_argument("--max-retries", type=int, default=2)

@@ -2,6 +2,7 @@ param(
     [int]$WorkerCount = 3,
     [int]$DetailWorkers = 3,
     [int]$ListWorkers = 6,
+    [int]$ListPageLimit = 0,
     [int]$MaxRetries = 2,
     [double]$StaleLockHours = 3,
     [double]$MinFreeGb = 20,
@@ -12,6 +13,7 @@ param(
     [string[]]$SourceDir = @(),
     [string]$ProgressDir = "",
     [string]$Python = "python",
+    [string]$ListSource = "html",
     [switch]$DryRun,
     [switch]$RetryFailed,
     [switch]$Visible
@@ -39,6 +41,13 @@ Write-Host "Workers: $WorkerCount"
 Write-Host "Detail workers per stock: $DetailWorkers"
 if ($CrawlMode -eq "full") {
     Write-Host "List workers per stock: $ListWorkers"
+    Write-Host "List source: $ListSource"
+    if ($ListSource -in @("api", "auto")) {
+        Write-Host "List source compatibility mode: $ListSource will run via fast requests html"
+    }
+    if ($ListPageLimit -gt 0) {
+        Write-Host "List page limit per stock: $ListPageLimit"
+    }
     Write-Host "Start date: $StartDate"
 }
 Write-Host "Progress dir: $ProgressDir"
@@ -67,6 +76,10 @@ for ($i = 1; $i -le $WorkerCount; $i++) {
     if ($CrawlMode -eq "full") {
         $workerArgs += @("--start-date", $StartDate)
         $workerArgs += @("--list-workers", "$ListWorkers")
+        $workerArgs += @("--list-source", $ListSource)
+        if ($ListPageLimit -gt 0) {
+            $workerArgs += @("--list-page-limit", "$ListPageLimit")
+        }
         if ($StockList) {
             $workerArgs += @("--stock-list", $StockList)
         }

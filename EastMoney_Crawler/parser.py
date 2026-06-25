@@ -170,11 +170,15 @@ class PostParser(object):
 
         return result
 
-    def _try_requests_caifuhao(self, post_url: str) -> dict:
+    def _try_requests_caifuhao(self, post_url: str, session=None) -> dict:
         """方向6：用 requests 快速获取财富号帖子正文（快5-10倍）
 
         直接 HTTP GET 财富号文章页面，用 BeautifulSoup 解析正文。
         失败时返回空 dict，调用方会回退到 Selenium。
+
+        Args:
+            post_url: 财富号文章 URL
+            session: 可选的 requests.Session，复用浏览器 cookies
         """
         result = {
             'post_content': '',
@@ -191,7 +195,8 @@ class PostParser(object):
                 'Accept': 'text/html,application/xhtml+xml',
                 'Accept-Language': 'zh-CN,zh;q=0.9',
             }
-            resp = requests.get(post_url, headers=headers, timeout=(3, 5))
+            fetcher = session if session else requests
+            resp = fetcher.get(post_url, headers=headers, timeout=(3, 5))
             if resp.status_code != 200:
                 return result
 

@@ -158,6 +158,99 @@ class FullModeExportTests(unittest.TestCase):
                 pipeline.TEMP_DIR = os.path.join(orig_project_dir, "temp_extract")
                 pipeline.EXPORT_DIR = os.path.join(orig_project_dir, "temp_export")
 
+    def test_rebuild_full_posts_from_page_cache_dedupes_and_sorts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            stock = "000001"
+            orig_project_dir = pipeline._PROJECT_DIR
+            try:
+                pipeline._PROJECT_DIR = str(tmp)
+                pipeline.TEMP_DIR = str(tmp / "temp_extract")
+                pipeline.EXPORT_DIR = str(tmp / "temp_export")
+                os.makedirs(pipeline.TEMP_DIR, exist_ok=True)
+                os.makedirs(pipeline.EXPORT_DIR, exist_ok=True)
+
+                pipeline.write_full_page_cache(stock, 1, [
+                    {"_id": "1", "post_date": "2024-01-01", "post_time": "10:00",
+                     "post_title": "old", "post_url": "https://guba.eastmoney.com/news,000001,1.html"},
+                    {"_id": "2", "post_date": "2025-01-01", "post_time": "10:00",
+                     "post_title": "new", "post_url": "https://guba.eastmoney.com/news,000001,2.html"},
+                ])
+                pipeline.write_full_page_cache(stock, 2, [
+                    {"_id": "2", "post_date": "2025-01-01", "post_time": "10:00",
+                     "post_title": "new duplicate", "post_url": "https://guba.eastmoney.com/news,000001,2.html"},
+                ])
+
+                stats = pipeline.rebuild_full_posts_from_page_cache(stock, page_limit=2)
+
+                self.assertEqual(stats["rows"], 2)
+                with Path(pipeline.full_posts_csv_path(stock)).open("r", encoding="utf-8") as handle:
+                    rows = list(csv.DictReader(handle))
+                self.assertEqual([row["post_id"] for row in rows], ["2", "1"])
+            finally:
+                pipeline._PROJECT_DIR = orig_project_dir
+                pipeline.TEMP_DIR = os.path.join(orig_project_dir, "temp_extract")
+                pipeline.EXPORT_DIR = os.path.join(orig_project_dir, "temp_export")
+
+    def test_export_refuses_partial_manifest(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            stock = "000001"
+            orig_project_dir = pipeline._PROJECT_DIR
+            try:
+                pipeline._PROJECT_DIR = str(tmp)
+                pipeline.TEMP_DIR = str(tmp / "temp_extract")
+                pipeline.EXPORT_DIR = str(tmp / "temp_export")
+                os.makedirs(pipeline.TEMP_DIR, exist_ok=True)
+                os.makedirs(pipeline.EXPORT_DIR, exist_ok=True)
+
+                full_csv = Path(pipeline.full_posts_csv_path(stock))
+                MinimalCsv(full_csv, [
+                    {"post_id": "1", "post_publish_time": "2025-01-01 10:00:00",
+                     "post_title": "sample", "url": "https://guba.eastmoney.com/news,000001,1.html", "content": "sample"},
+                ])
+                pipeline.write_full_manifest(stock, "2009-01-01", {
+                    "max_page": 100, "boundary_page": 50, "completed_pages": 50,
+                    "failed_pages": [], "rows": 1, "unique_post_ids": 1,
+                    "min_time": "2025-01-01 10:00", "max_time": "2025-01-01 10:00",
+                    "partial": True, "page_limit": 50,
+                })
+
+                result = pipeline.export_full_posts(stock, "2009-01-01")
+                self.assertIsNone(result)
+            finally:
+                pipeline._PROJECT_DIR = orig_project_dir
+                pipeline.TEMP_DIR = os.path.join(orig_project_dir, "temp_extract")
+                pipeline.EXPORT_DIR = os.path.join(orig_project_dir, "temp_export")
+
+    def test_stage2_full_refuses_partial_manifest(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            stock = "000001"
+            orig_project_dir = pipeline._PROJECT_DIR
+            orig_stock = pipeline.STOCK_CODE
+            try:
+                pipeline._PROJECT_DIR = str(tmp)
+                pipeline.STOCK_CODE = stock
+                pipeline.TEMP_DIR = str(tmp / "temp_extract")
+                pipeline.EXPORT_DIR = str(tmp / "temp_export")
+                pipeline.PIPELINE_FLAG_DIR = str(tmp / ".pipeline_flags")
+                os.makedirs(pipeline.TEMP_DIR, exist_ok=True)
+                os.makedirs(pipeline.PIPELINE_FLAG_DIR, exist_ok=True)
+                pipeline.write_full_manifest(stock, "2009-01-01", {
+                    "max_page": 100, "boundary_page": 50, "completed_pages": 50,
+                    "failed_pages": [], "rows": 1, "unique_post_ids": 1,
+                    "partial": True, "page_limit": 50,
+                })
+
+                self.assertFalse(pipeline.run_stage2_full())
+            finally:
+                pipeline._PROJECT_DIR = orig_project_dir
+                pipeline.STOCK_CODE = orig_stock
+                pipeline.TEMP_DIR = os.path.join(orig_project_dir, "temp_extract")
+                pipeline.EXPORT_DIR = os.path.join(orig_project_dir, "temp_export")
+                pipeline.PIPELINE_FLAG_DIR = os.path.join(orig_project_dir, ".pipeline_flags")
+
 
 class FullModeStageCommandTests(unittest.TestCase):
     def test_build_stage_cmd_full_mode(self):

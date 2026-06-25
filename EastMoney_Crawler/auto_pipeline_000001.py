@@ -33,6 +33,11 @@ import pandas as pd
 from mongodb import MongoAPI
 from crawler import PostCrawler, CommentCrawler
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # ==================== 配置 ====================
 _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -71,6 +76,9 @@ CSV_FIELDNAMES = [
 CRAWL_MODE = 'incremental'  # 'incremental' | 'full'
 START_DATE = '2009-01-01'
 LIST_WORKERS = 6
+LIST_WINDOW_SIZE = 80
+LIST_SOURCE = 'html'
+LIST_PAGE_LIMIT = 0
 
 # ==============================================
 
@@ -142,6 +150,15 @@ def full_posts_csv_path(stock_code: str) -> str:
 def full_manifest_path(stock_code: str) -> str:
     """Stage 1 full 模式产物清单"""
     return os.path.join(TEMP_DIR, f'{stock_code}_full_manifest.json')
+
+
+def full_page_cache_dir(stock_code: str) -> str:
+    """Per-page cache for resumable full-mode Stage 1 list pages."""
+    return os.path.join(TEMP_DIR, f'{stock_code}_full_pages')
+
+
+def full_page_cache_path(stock_code: str, page_num: int) -> str:
+    return os.path.join(full_page_cache_dir(stock_code), f'page_{int(page_num):06d}.json')
 
 
 def full_output_csv_path(stock_code: str, start_date: str) -> str:
@@ -373,6 +390,128 @@ def crawl_post_list(stock_code: str, existing_ids: set, stop_date: str):
     print(f'  ✓ 新帖子已追加到 CSV，新增 {new_count[0]} 条，过滤重复 {skip_count[0]} 条')
 
 
+def _full_csv_row_from_post_dict(stock_code: str, dic: dict) -> dict | None:
+    pid = str(dic.get('_id', ''))
+    if not pid:
+        return None
+    post_date = dic.get('post_date', '')
+    post_time = dic.get('post_time', '')
+    publish_time = f"{post_date} {post_time}".strip() if post_time else post_date
+    return {
+        'user_id': dic.get('user_id', ''),
+        'post_id': pid,
+        'post_source_id': dic.get('post_source_id', ''),
+        'post_type': dic.get('post_type', ''),
+        'user_name': dic.get('post_author', ''),
+        'post_publish_time': publish_time,
+        'stockbar_name': dic.get('stockbar_name', ''),
+        'stockbar_code': dic.get('stockbar_code', stock_code),
+        'forward': dic.get('forward', '0'),
+        'coment_count': dic.get('comment_num', 0),
+        'click_count': dic.get('post_view', 0),
+        'post_title': dic.get('post_title', ''),
+        'url': dic.get('post_url', ''),
+        'content': dic.get('post_content', ''),
+    }
+
+
+def clear_full_stage1_artifacts(stock_code: str):
+    for path in (full_posts_csv_path(stock_code), full_manifest_path(stock_code)):
+        if os.path.exists(path):
+            os.remove(path)
+            print(f'  cleared {path}')
+    cache_dir = full_page_cache_dir(stock_code)
+    if os.path.isdir(cache_dir):
+        shutil.rmtree(cache_dir)
+        print(f'  cleared {cache_dir}')
+
+
+def write_full_page_cache(stock_code: str, page_num: int, rows: list, meta: dict | None = None):
+    os.makedirs(full_page_cache_dir(stock_code), exist_ok=True)
+    payload = {
+        'stock': stock_code,
+        'page': int(page_num),
+        'rows': rows,
+        'meta': meta or {},
+        'created_at': datetime.now().isoformat(),
+    }
+    path = full_page_cache_path(stock_code, page_num)
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False)
+        f.write('\n')
+    os.replace(tmp, path)
+
+
+def read_full_page_cache(stock_code: str, page_num: int) -> dict | None:
+    path = full_page_cache_path(stock_code, page_num)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def cached_full_pages(stock_code: str, max_page: int | None = None) -> set[int]:
+    cache_dir = full_page_cache_dir(stock_code)
+    if not os.path.isdir(cache_dir):
+        return set()
+    pages = set()
+    for filename in os.listdir(cache_dir):
+        if not filename.startswith('page_') or not filename.endswith('.json'):
+            continue
+        try:
+            page_num = int(filename[5:-5])
+        except ValueError:
+            continue
+        if max_page is None or page_num <= max_page:
+            pages.add(page_num)
+    return pages
+
+
+def rebuild_full_posts_from_page_cache(
+    stock_code: str,
+    page_limit: int | None = None,
+    boundary_page: int | None = None,
+) -> dict:
+    max_page = page_limit or boundary_page
+    pages = sorted(cached_full_pages(stock_code, max_page=max_page))
+    full_csv = full_posts_csv_path(stock_code)
+    rows = []
+    seen_ids = set()
+    for page_num in pages:
+        payload = read_full_page_cache(stock_code, page_num)
+        if not payload:
+            continue
+        for dic in payload.get('rows') or []:
+            row = _full_csv_row_from_post_dict(stock_code, dic)
+            if not row:
+                continue
+            pid = str(row.get('post_id', ''))
+            if pid in seen_ids:
+                continue
+            seen_ids.add(pid)
+            rows.append(row)
+
+    rows.sort(key=lambda r: r.get('post_publish_time', '').strip(), reverse=True)
+    with open(full_csv, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    times = [r.get('post_publish_time', '').strip() for r in rows if r.get('post_publish_time', '').strip()]
+    return {
+        'rows': len(rows),
+        'unique_post_ids': len(seen_ids),
+        'cached_pages': pages,
+        'completed_pages': len(pages),
+        'min_time': min(times) if times else '',
+        'max_time': max(times) if times else '',
+    }
+
+
 def make_full_storage_callback(stock_code: str):
     """full 模式专用 CSV 写入回调，直接写 {stock}_full_posts.csv"""
     full_csv = full_posts_csv_path(stock_code)
@@ -430,6 +569,15 @@ def write_full_manifest(stock_code: str, start_date: str, summary: dict):
         "boundary_page": summary.get('boundary_page', 0),
         "completed_pages": summary.get('completed_pages', 0),
         "failed_pages": summary.get('failed_pages', []),
+        "blocked_pages": summary.get('blocked_pages', []),
+        "transient_failed_pages": summary.get('transient_failed_pages', []),
+        "status": summary.get('status', 'success'),
+        "partial": bool(summary.get('partial', False)),
+        "page_limit": summary.get('page_limit', 0),
+        "list_source": summary.get('list_source', 'html'),
+        "list_workers": summary.get('list_workers', LIST_WORKERS),
+        "list_window_size": summary.get('list_window_size', LIST_WINDOW_SIZE),
+        "skipped_cached_pages": summary.get('skipped_cached_pages', 0),
         "rows": summary.get('rows', 0),
         "unique_post_ids": summary.get('unique_post_ids', 0),
         "min_time": summary.get('min_time', ''),
@@ -533,9 +681,16 @@ def validate_stage1_inputs(stock_code: str, source_dirs: list | None, force_refr
     return source_csv, False
 
 
-def run_stage1(source_dirs: list = None, force_refresh_base: bool = False):
+def run_stage1(source_dirs: list = None, force_refresh_base: bool = False, force_full_refresh: bool = False):
     if CRAWL_MODE == 'full':
-        return run_stage1_full(start_date=START_DATE, list_workers=LIST_WORKERS)
+        return run_stage1_full(
+            start_date=START_DATE,
+            list_workers=LIST_WORKERS,
+            list_window_size=LIST_WINDOW_SIZE,
+            list_source=LIST_SOURCE,
+            list_page_limit=LIST_PAGE_LIMIT,
+            force_full_refresh=force_full_refresh,
+        )
 
     print(f'\n{"="*60}')
     print(f'[Stage 1] {STOCK_CODE} 提取 CSV + 爬取帖子列表')
@@ -611,10 +766,18 @@ def run_stage1(source_dirs: list = None, force_refresh_base: bool = False):
     return True
 
 
-def run_stage1_full(start_date: str, list_workers: int):
+def run_stage1_full(
+    start_date: str,
+    list_workers: int,
+    list_window_size: int = 30,
+    list_source: str = "html",
+):
     """full 模式 Stage 1：从网页全量抓取 start_date 之后的帖子列表。"""
+    if list_source != "html":
+        print(f'  [兼容] 已切换回上游 Selenium HTML 方法，忽略 list_source={list_source}')
+        list_source = "html"
     print(f'\n{"="*60}')
-    print(f'[Stage 1 full] {STOCK_CODE} 全量爬取帖子列表（start_date={start_date}）')
+    print(f'[Stage 1 full] {STOCK_CODE} 全量爬取帖子列表（start_date={start_date}, list_source={list_source}）')
     print(f'{"="*60}')
 
     if not check_disk_space(min_gb=1.0):
@@ -634,6 +797,8 @@ def run_stage1_full(start_date: str, list_workers: int):
         start_date=start_date,
         storage_callback=callback,
         list_workers=list_workers,
+        list_window_size=list_window_size,
+        list_source=list_source,
     )
     print(f'  ✓ 全量帖子已写入 CSV: {full_csv}')
     print(f'    总页数={summary.get("max_page")}, 边界页={summary.get("boundary_page")}, '
@@ -641,9 +806,18 @@ def run_stage1_full(start_date: str, list_workers: int):
           f'行数={summary.get("rows")}, 唯一ID={summary.get("unique_post_ids")}, '
           f'时间范围={summary.get("min_time")} ~ {summary.get("max_time")}')
 
-    if summary.get('failed_pages'):
-        print(f'[警告] Stage 1 full 存在失败页面: {summary["failed_pages"]}')
-        print(f'[警告] 继续写入 manifest，后续可在网络环境改善后通过 --retry-failed 补爬')
+    if summary.get('status') == 'paused_blocked':
+        print(f'\n[错误] Stage 1 full 因验证/限流暂停！')
+        print(f'  原因: {summary.get("paused_reason")}')
+        print(f'  阻塞页: {summary.get("blocked_pages")}')
+        print(f'  恢复步骤:')
+        print(f'    1. python auto_pipeline_000001.py --stock {STOCK_CODE} --manual-verify')
+        print(f'    2. 重新运行 Stage 1（会自动断点续爬）')
+    elif summary.get('failed_pages'):
+        print(f'\n[警告] Stage 1 full 存在 {len(summary["failed_pages"])} 个失败页: {summary["failed_pages"]}')
+        print(f'  [提示] 可重新运行 Stage 1 进行补爬（断点续爬会自动跳过已成功的页）')
+    else:
+        print(f'\n[成功] Stage 1 full 完整完成！')
 
     write_full_manifest(STOCK_CODE, start_date, summary)
     print(f'  ✓ full manifest 已写入: {full_manifest_path(STOCK_CODE)}')
@@ -651,6 +825,97 @@ def run_stage1_full(start_date: str, list_workers: int):
     set_flag('stage1')
     print(f'\n{"="*60}')
     print(f'[Stage 1 full] 完成！请在新 PowerShell 窗口运行 Stage 2')
+    print(f'{"="*60}')
+    return True
+
+
+def run_stage1_full(
+    start_date: str,
+    list_workers: int,
+    list_window_size: int = 80,
+    list_source: str = "html",
+    list_page_limit: int = 0,
+    force_full_refresh: bool = False,
+):
+    """Full-mode Stage 1 using fast requests HTML list pages plus page cache."""
+    print(f'\n{"="*60}')
+    print(f'[Stage 1 full] {STOCK_CODE} fast list crawl '
+          f'(start_date={start_date}, list_source={list_source}, '
+          f'workers={list_workers}, page_limit={list_page_limit or "none"})')
+    print(f'{"="*60}')
+
+    if not check_disk_space(min_gb=1.0):
+        return False
+    ensure_dirs()
+
+    if force_full_refresh:
+        print('  force refresh enabled; clearing full-mode temporary artifacts')
+        clear_full_stage1_artifacts(STOCK_CODE)
+        clear_flags()
+
+    page_limit = int(list_page_limit or 0)
+    page_limit_or_none = page_limit if page_limit > 0 else None
+    cached_pages_set = cached_full_pages(STOCK_CODE, max_page=page_limit_or_none)
+    if cached_pages_set:
+        print(f'  resume cache: {len(cached_pages_set)} pages already cached')
+
+    def storage_callback(_rows):
+        return None
+
+    def page_storage_callback(page_num, rows, meta):
+        write_full_page_cache(STOCK_CODE, page_num, rows, meta)
+
+    post_crawler = PostCrawler(STOCK_CODE)
+    summary = post_crawler.crawl_post_info_since(
+        start_date=start_date,
+        storage_callback=storage_callback,
+        list_workers=list_workers,
+        list_window_size=list_window_size,
+        list_source=list_source,
+        cached_pages=cached_pages_set,
+        page_storage_callback=page_storage_callback,
+        window_pause_range=(3.0, 8.0),
+        page_limit=page_limit_or_none,
+    )
+
+    rebuild_stats = rebuild_full_posts_from_page_cache(
+        STOCK_CODE,
+        page_limit=page_limit_or_none,
+        boundary_page=summary.get('boundary_page') or None,
+    )
+    summary.update({
+        'rows': rebuild_stats['rows'],
+        'unique_post_ids': rebuild_stats['unique_post_ids'],
+        'completed_pages': rebuild_stats['completed_pages'],
+        'min_time': rebuild_stats['min_time'],
+        'max_time': rebuild_stats['max_time'],
+        'partial': bool(page_limit_or_none),
+        'page_limit': page_limit_or_none or 0,
+    })
+    full_csv = full_posts_csv_path(STOCK_CODE)
+    print(f'  full_posts rebuilt: {full_csv}')
+    print(f'  pages={summary.get("completed_pages")}/{summary.get("boundary_page")} '
+          f'rows={summary.get("rows")} unique={summary.get("unique_post_ids")} '
+          f'failed={summary.get("failed_pages")} blocked={summary.get("blocked_pages")} '
+          f'time={summary.get("time_cost_seconds")}s')
+
+    write_full_manifest(STOCK_CODE, start_date, summary)
+    print(f'  full manifest written: {full_manifest_path(STOCK_CODE)}')
+
+    status = summary.get('status')
+    if status == 'paused_blocked':
+        print('  [error] Stage 1 full paused because validation/anti-bot persisted after retries')
+        return False
+    if summary.get('failed_pages'):
+        print(f'  [error] Stage 1 full still has failed pages: {summary.get("failed_pages")}')
+        return False
+    if page_limit_or_none:
+        print('  [partial] Trial crawl finished. Stage 2/3 are intentionally blocked for partial manifests.')
+        return True
+
+    set_flag('stage1')
+    print(f'\n{"="*60}')
+    print('[Stage 1 full] complete; run Stage 2 next')
     print(f'{"="*60}')
     return True
 
@@ -929,6 +1194,7 @@ def crawl_post_detail_csv(stock_code: str, csv_paths: list, detail_workers: int 
     crawl_count = [0]
     batch_done = set()
     cb_lock = threading.Lock()
+    stage2_start = time.time()
 
     def update_callback(post_id, update_data):
         pid = str(post_id)
@@ -949,6 +1215,12 @@ def crawl_post_detail_csv(stock_code: str, csv_paths: list, detail_workers: int 
             if crawl_count[0] % CHECKPOINT_INTERVAL == 0:
                 _save_checkpoint(stock_code, batch_done)
                 batch_done.clear()
+                # Real-time progress for Stage 2
+                elapsed = time.time() - stage2_start
+                speed = crawl_count[0] / max(elapsed / 60, 0.01)
+                eta_min = (len(posts) - crawl_count[0]) / max(speed, 0.01)
+                print(f'  [Stage 2] 进度 {crawl_count[0]}/{len(posts)} ({crawl_count[0]/len(posts)*100:.0f}%) | '
+                      f'耗时 {elapsed:.0f}s | 速度 {speed:.1f}条/分 | 预计剩余 {eta_min:.0f}分')
 
     post_crawler = PostCrawler(stock_code)
     post_crawler.crawl_post_detail(
@@ -1019,6 +1291,11 @@ def run_stage2_full(detail_workers: int = 3):
     print(f'\n{"="*60}')
     print(f'[Stage 2 full] {STOCK_CODE} 正文补爬')
     print(f'{"="*60}')
+
+    partial_manifest = read_full_manifest(STOCK_CODE)
+    if partial_manifest and partial_manifest.get('partial'):
+        print('[error] Stage 2 full refused: manifest is partial/trial output')
+        return False
 
     if not check_flag('stage1'):
         print('[错误] Stage 1 未完成，请先运行 Stage 1')
@@ -1170,6 +1447,10 @@ def export_full_posts(stock_code: str, start_date: str) -> str | None:
 
     if manifest.get('crawl_mode') != 'full':
         print(f'  [错误] manifest crawl_mode 不是 full: {manifest.get("crawl_mode")}')
+        return None
+
+    if manifest.get('partial'):
+        print('  [error] Stage 3 full refused: manifest is partial/trial output')
         return None
 
     if manifest.get('failed_pages'):
@@ -1461,7 +1742,7 @@ def run_stage3_full(start_date: str):
 # ==================== 主入口 ====================
 
 def main():
-    global STOCK_CODE, CRAWL_MODE, START_DATE, LIST_WORKERS
+    global STOCK_CODE, CRAWL_MODE, START_DATE, LIST_WORKERS, LIST_WINDOW_SIZE, LIST_SOURCE, LIST_PAGE_LIMIT
     parser = argparse.ArgumentParser(description='000001 自动化数据流水线 (CSV-Native 高速版)')
     parser.add_argument('--stock', default=STOCK_CODE,
                         help='股票代码，默认 000001；可传 1/000001/600000 等格式')
@@ -1472,21 +1753,36 @@ def main():
     parser.add_argument('--start-date', default='2009-01-01',
                         help='full 模式起始日期（YYYY-MM-DD），默认 2009-01-01')
     parser.add_argument('--list-workers', type=int, default=6,
-                        help='full 模式 Stage 1 列表页并发数，默认 6')
+                        help='兼容参数；当前上游 Selenium HTML 方法按单浏览器顺序翻页')
+    parser.add_argument('--list-window-size', type=int, default=80,
+                        help='兼容参数；用于 full 模式进度日志')
+    parser.add_argument('--list-source', choices=['html', 'api', 'auto', 'selenium'], default='html',
+                        help='full 模式 Stage 1 列表数据源；当前固定使用上游 Selenium HTML 方法，api/auto 会按 html 处理')
+    parser.add_argument('--list-page-limit', type=int, default=0,
+                        help='full Stage 1 trial limit; e.g. 50 crawls only first 50 pages and marks manifest partial')
     parser.add_argument('--detail-workers', type=int, default=3,
                         help='Stage 2 财富号正文 requests 并发数，默认 3。设为 1 回退单线程')
     parser.add_argument('--source-dir', action='append', default=[],
                         help='Stage 1 incremental 历史 CSV 目录，可重复传入；full 模式不需要')
     parser.add_argument('--force-refresh-base', action='store_true',
                         help='Stage 1 强制从 --source-dir 重新复制最新历史 CSV，忽略 temp_extract 中已存在的 base')
+    parser.add_argument('--force-full-refresh', action='store_true',
+                        help='Stage 1 full: clear full_posts, full manifest, page cache, and stage flags before crawling')
     args = parser.parse_args()
     STOCK_CODE = str(args.stock).strip().zfill(6)
     CRAWL_MODE = args.crawl_mode
     START_DATE = args.start_date
     LIST_WORKERS = args.list_workers
+    LIST_WINDOW_SIZE = args.list_window_size
+    LIST_SOURCE = args.list_source
+    LIST_PAGE_LIMIT = args.list_page_limit
 
     if args.stage == 1:
-        ok = run_stage1(source_dirs=args.source_dir, force_refresh_base=args.force_refresh_base)
+        ok = run_stage1(
+            source_dirs=args.source_dir,
+            force_refresh_base=args.force_refresh_base,
+            force_full_refresh=args.force_full_refresh,
+        )
     elif args.stage == 2:
         ok = run_stage2(detail_workers=args.detail_workers)
     elif args.stage == 3:

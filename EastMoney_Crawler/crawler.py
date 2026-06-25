@@ -6,6 +6,7 @@ import json
 import re
 import math
 import hashlib
+import urllib.parse
 import pandas as pd
 import os
 import requests
@@ -21,6 +22,45 @@ from parser import CommentParser
 from browser_utils import create_stealth_chrome
 
 
+class FullCrawlPaused(RuntimeError):
+    """Raised when full-mode list crawling should pause instead of retrying."""
+
+    def __init__(self, page_num: int, reason: str, retry_after_seconds: int = 3600):
+        super().__init__(f'page {page_num} paused: {reason}')
+        self.page_num = page_num
+        self.reason = reason
+        self.retry_after_seconds = retry_after_seconds
+
+
+def _looks_like_blocked_error(error: Exception | str) -> bool:
+    text = str(error)
+    return any(
+        marker in text
+        for marker in (
+            'fd_guba_validate',
+            '身份核实',
+            'validation',
+            'HTTP 403',
+            'HTTP 429',
+            'blocked by validation',
+        )
+    )
+
+
+def _looks_like_blocked_response(response_text: str) -> bool:
+    if not response_text:
+        return False
+    return any(
+        marker in response_text
+        for marker in (
+            'fd_guba_validate',
+            '身份核实',
+            '请完成安全验证',
+            '请输入验证码',
+        )
+    )
+
+
 class PostCrawler(object):
     LIST_HEADERS = {
         'User-Agent': (
@@ -31,15 +71,31 @@ class PostCrawler(object):
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'zh-CN,zh;q=0.9',
         'Referer': 'https://guba.eastmoney.com/',
+        'Connection': 'keep-alive',
     }
     POSTS_PER_PAGE = 80
+    FAST_LIST_SOURCES = {'html', 'api', 'auto'}
 
-    def __init__(self, stock_symbol: str):
+    def __init__(self, stock_symbol: str, proxy: str = ""):
         self.browser = None
         self.symbol = stock_symbol
         self.start = time.time()  # calculate the time cost
-        self.session = requests.Session()
-        self.session.headers.update(self.LIST_HEADERS)
+        self.proxy = proxy
+        self.session = self._new_list_session()
+        self._cookie_bootstrap_lock = threading.Lock()
+        self._browser_cookie_bootstrapped = False
+
+    def _request_proxies(self) -> dict | None:
+        if not self.proxy:
+            return None
+        return {'http': self.proxy, 'https': self.proxy}
+
+    def _new_list_session(self, cookies: dict | None = None) -> requests.Session:
+        session = requests.Session()
+        session.headers.update(self.LIST_HEADERS)
+        if cookies:
+            session.cookies.update(cookies)
+        return session
 
     def create_webdriver(self):
         current_dir = os.path.dirname(os.path.abspath(__file__))  # hide the features of crawler/selenium
@@ -54,19 +110,38 @@ class PostCrawler(object):
                 pass
         self.create_webdriver()
 
+    def _browser_is_blocked(self) -> bool:
+        if self.browser is None:
+            return False
+        try:
+            current_url = self.browser.current_url or ''
+            title = self.browser.title or ''
+            source = self.browser.page_source[:5000] if self.browser.page_source else ''
+        except Exception:
+            return False
+        return (
+            'fd_guba_validate' in current_url
+            or title == '验证'
+            or '身份核实' in title
+            or _looks_like_blocked_response(source)
+        )
+
     def get_page_num(self):
         try:
-            html = self._fetch_list_html(1)
+            html = self._fetch_list_html(1, session=self.session)
             payload = self._extract_article_payload(html)
             total_count = int(payload.get('count') or 0)
             if total_count > 0:
                 return max(1, math.ceil(total_count / self.POSTS_PER_PAGE))
-        except Exception:
-            pass
+        except Exception as e:
+            if _looks_like_blocked_error(e):
+                raise FullCrawlPaused(1, str(e), retry_after_seconds=3600)
 
         if self.browser is None:
             self.create_webdriver()
         self.browser.get(f'http://guba.eastmoney.com/list,{self.symbol},f_1.html')
+        if self._browser_is_blocked():
+            raise FullCrawlPaused(1, 'list page redirected to validation', retry_after_seconds=3600)
         try:
             page_element = self.browser.find_element(By.CSS_SELECTOR, 'ul.paging > li:nth-child(7) > a > span')
             return int(page_element.text)
@@ -99,26 +174,54 @@ class PostCrawler(object):
             pass
         return f'{self.symbol}吧'
 
-    def _fetch_list_html(self, page_num: int) -> str:
+    def _fetch_list_html(self, page_num: int, session: requests.Session | None = None) -> str:
+        session = session or self.session
         url = f'https://guba.eastmoney.com/list,{self.symbol},f_{page_num}.html'
-        resp = self.session.get(url, timeout=(3, 12))
+        resp = session.get(url, timeout=(3, 12), proxies=self._request_proxies())
+        if resp.status_code in (403, 429):
+            raise RuntimeError(f'HTTP {resp.status_code}')
         resp.raise_for_status()
-        # 检查重定向到验证页或返回了验证页内容
-        if 'fd_guba_validate' in resp.url or '身份核实' in resp.text[:5000]:
-            raise RuntimeError('list page redirected to validation')
-        # 有时验证页不会触发 URL 变化，而是直接返回空或验证提示；若未解析到 article_list，
-        # 调用方会抛出 ValueError，此处不额外拦截，让外层重试机制生效。
         resp.encoding = resp.encoding or 'utf-8'
-        return resp.text
+        text = resp.text
+        if 'fd_guba_validate' in resp.url or _looks_like_blocked_response(text[:5000]):
+            raise RuntimeError('list page redirected to validation')
+        return text
 
     @staticmethod
-    def _extract_article_payload(html: str) -> dict:
-        match = re.search(r'var\s+article_list\s*=\s*(\{.*?\});\s*var\s+other_list', html, re.S)
-        if not match:
-            match = re.search(r'var\s+article_list\s*=\s*(\{.*?\});', html, re.S)
+    def _extract_json_object(text: str, start_index: int) -> str | None:
+        depth = 0
+        in_string = False
+        escape = False
+        for index in range(start_index, len(text)):
+            char = text[index]
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == '\\':
+                    escape = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == '{':
+                depth += 1
+            elif char == '}':
+                depth -= 1
+                if depth == 0:
+                    return text[start_index:index + 1]
+        return None
+
+    @classmethod
+    def _extract_article_payload(cls, html: str) -> dict:
+        match = re.search(r'var\s+article_list\s*=\s*\{', html)
         if not match:
             raise ValueError('article_list payload not found')
-        return json.loads(match.group(1))
+        json_start = html.find('{', match.start())
+        json_text = cls._extract_json_object(html, json_start)
+        if not json_text:
+            raise ValueError('article_list JSON parse failed')
+        return json.loads(json_text)
 
     @staticmethod
     def _extract_post_key_from_href(href: str) -> str:
@@ -132,13 +235,12 @@ class PostCrawler(object):
             return match.group(1)
         return ''
 
-    def _extract_visible_post_keys(self, html: str, page_num: int) -> list:
+    def _extract_visible_post_keys(self, html: str, page_num: int) -> list[str]:
         soup = BeautifulSoup(html, 'html.parser')
         rows = soup.select('tr.listitem')
         if page_num == 1 and rows:
-            rows = rows[1:]  # keep legacy behavior: skip first cross-bar/pinned row
-
-        keys = []
+            rows = rows[1:]
+        keys: list[str] = []
         for row in rows:
             link = row.select_one('td:nth-child(3) a')
             if not link:
@@ -167,18 +269,13 @@ class PostCrawler(object):
 
     def _article_to_post_info(self, article: dict, default_stockbar_name: str = '') -> dict:
         post_id = str(article.get('post_id') or '')
-        source_id = str(article.get('post_source_id') or '')
+        source_id = str(article.get('post_source_id') or article.get('source_post_id') or '')
         post_type = str(article.get('post_type') if article.get('post_type') is not None else '')
         stockbar_code = str(article.get('stockbar_code') or self.symbol)
-        stockbar_name = (
-            article.get('stockbar_name')
-            or default_stockbar_name
-            or f'{self.symbol}吧'
-        )
+        stockbar_name = article.get('stockbar_name') or default_stockbar_name or f'{self.symbol}吧'
         publish_time = article.get('post_publish_time') or article.get('post_display_time') or ''
         post_date = publish_time[:10] if len(publish_time) >= 10 else ''
         post_time = publish_time[11:16] if len(publish_time) >= 16 else ''
-
         user = article.get('post_user') or {}
         user_id = article.get('user_id') or user.get('user_id') or ''
         author = article.get('user_nickname') or user.get('user_nickname') or ''
@@ -205,28 +302,98 @@ class PostCrawler(object):
             'forward': str(self._normalise_count(article.get('post_forward_count'))),
         }
 
-    def _fetch_post_page_fast(self, page_num: int) -> list:
-        html = self._fetch_list_html(page_num)
-        payload = self._extract_article_payload(html)
-        default_stockbar_name = (payload.get('bar_name') or self.symbol)
-        if default_stockbar_name and not default_stockbar_name.endswith('吧'):
+    def _bootstrap_list_session_via_browser(self):
+        with self._cookie_bootstrap_lock:
+            if self._browser_cookie_bootstrapped and self.session.cookies:
+                return
+            browser = create_stealth_chrome()
+            try:
+                browser.get(f'https://guba.eastmoney.com/list,{self.symbol},f_1.html')
+                time.sleep(2)
+                for cookie in browser.get_cookies():
+                    name = cookie.get('name')
+                    value = cookie.get('value')
+                    if name and value is not None:
+                        self.session.cookies.set(name, value, domain='.eastmoney.com')
+                self._browser_cookie_bootstrapped = True
+                print(f'{self.symbol}: warmed requests cookies from browser once')
+            finally:
+                browser.quit()
+
+    def _fetch_article_payload_api(self, page_num: int, session: requests.Session | None = None) -> dict:
+        session = session or self.session
+        path = 'webarticlelist/api/Article/Articlelist'
+        url = (
+            f'https://guba.eastmoney.com/api/getData?code={self.symbol}'
+            f'&path={urllib.parse.quote(path, safe="")}'
+        )
+        data = {
+            'param': f'code={self.symbol}&type=0&p={page_num}&ps={self.POSTS_PER_PAGE}&sorttype=0',
+            'plat': 'Web',
+            'path': path,
+            'env': '2',
+            'origin': '',
+            'version': '2022',
+            'product': 'Guba',
+        }
+        headers = dict(self.LIST_HEADERS)
+        headers.update({
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'Origin': 'https://guba.eastmoney.com',
+            'Referer': f'https://guba.eastmoney.com/list,{self.symbol},f_{page_num}.html',
+        })
+        resp = session.post(url, data=data, headers=headers, timeout=(3, 12), proxies=self._request_proxies())
+        if resp.status_code in (403, 429):
+            raise RuntimeError(f'HTTP {resp.status_code}')
+        resp.raise_for_status()
+        if _looks_like_blocked_response(resp.text[:5000]):
+            raise RuntimeError('list API redirected to validation')
+        payload = resp.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get('re'), list):
+            raise ValueError(f'Articlelist API payload invalid: {str(payload)[:120]}')
+        return payload
+
+    def _fetch_article_payload_api_with_bootstrap(
+        self,
+        page_num: int,
+        session: requests.Session | None = None,
+    ) -> dict:
+        session = session or self.session
+        try:
+            return self._fetch_article_payload_api(page_num, session=session)
+        except ValueError:
+            self._bootstrap_list_session_via_browser()
+            session.cookies.update(self.session.cookies.get_dict())
+            return self._fetch_article_payload_api(page_num, session=session)
+
+    def _fetch_post_page_fast(self, page_num: int, session: requests.Session | None = None) -> list:
+        payload = self._fetch_article_payload_api_with_bootstrap(page_num, session=session)
+        default_stockbar_name = payload.get('bar_name') or f'{self.symbol}吧'
+        if default_stockbar_name and not str(default_stockbar_name).endswith('吧'):
             default_stockbar_name = f'{default_stockbar_name}吧'
 
-        article_map = {}
+        article_map: dict[str, dict] = {}
         for article in payload.get('re') or []:
             post_id = str(article.get('post_id') or '')
-            source_id = str(article.get('post_source_id') or '')
+            source_id = str(article.get('post_source_id') or article.get('source_post_id') or '')
             if post_id:
                 article_map[post_id] = article
             if source_id:
                 article_map[source_id] = article
 
-        visible_keys = self._extract_visible_post_keys(html, page_num)
+        visible_keys = []
+        if page_num == 1:
+            try:
+                html = self._fetch_list_html(page_num, session=session)
+                visible_keys = self._extract_visible_post_keys(html, page_num)
+            except Exception:
+                visible_keys = []
         if not visible_keys:
             visible_keys = [
-                str(a.get('post_source_id') or a.get('post_id'))
-                for a in (payload.get('re') or [])
-                if a.get('post_id')
+                str(article.get('post_source_id') or article.get('source_post_id') or article.get('post_id'))
+                for article in (payload.get('re') or [])
+                if article.get('post_id')
             ]
             if page_num == 1 and visible_keys:
                 visible_keys = visible_keys[1:]
@@ -238,23 +405,22 @@ class PostCrawler(object):
             if not article:
                 continue
             dic = self._article_to_post_info(article, default_stockbar_name=default_stockbar_name)
-            if not dic.get('_id') or dic['_id'] in seen_ids:
+            pid = str(dic.get('_id') or '')
+            if not pid or pid in seen_ids:
                 continue
             if 'guba.eastmoney.com/news' in dic['post_url'] or 'caifuhao.eastmoney.com/news' in dic['post_url']:
-                seen_ids.add(dic['_id'])
+                seen_ids.add(pid)
                 dic_list.append(dic)
         return dic_list
 
     def fetch_post_page(self, page_num: int, parser: PostParser, stockbar_name: str = ''):
-        try:
-            return self._fetch_post_page_fast(page_num)
-        except Exception as fast_error:
-            print(f'{self.symbol}: 第 {page_num} 页快速解析失败，回退 Selenium: {fast_error}')
-
+        """Fetch one list page with the upstream Selenium DOM method."""
         if self.browser is None:
             self.create_webdriver()
         url = f'http://guba.eastmoney.com/list,{self.symbol},f_{page_num}.html'
         self.browser.get(url)
+        if self._browser_is_blocked():
+            raise RuntimeError('list page redirected to validation')
         dic_list = []
         list_item = self.browser.find_elements(By.CSS_SELECTOR, '.listitem')  # includes all posts on one page
         if page_num == 1:
@@ -404,7 +570,7 @@ class PostCrawler(object):
 
         # 先爬财富号帖子（多线程 requests）
         if caifuhao_posts:
-            self._crawl_caifuhao_posts(caifuhao_posts, update_callback, max_workers=min(worker_count * 2, 8))
+            self._crawl_caifuhao_posts(caifuhao_posts, update_callback, max_workers=max(1, worker_count // 2))
 
         # 爬非财富号帖子
         if guba_posts:
@@ -415,41 +581,58 @@ class PostCrawler(object):
 
         print(f'{self.symbol}: 正文爬取完成，共处理 {total} 条帖子')
 
-    def _crawl_caifuhao_posts(self, posts: list, update_callback, max_workers: int = 2):
-        """多线程爬取财富号帖子（仅使用 requests，无浏览器兜底）
+    def _crawl_caifuhao_posts(self, posts: list, update_callback, max_workers: int = 1):
+        """多线程爬取财富号帖子（窗口分批 + 请求延迟 + 自适应降级）
 
-        财富号历史文章可能已删除/失效。此处不能调用 parse_post_detail()，
-        因为它在 requests 为空时会回退 Selenium，失效文章多时会导致 Stage 2 长时间卡住。
+        借鉴 Stage 1 fast HTML 的成功经验：
+        - 浏览器 Cookie 预热 → 共享 Session 伪装身份
+        - 窗口分批（WINDOW_SIZE 条/批），批间冷却暂停
+        - 请求间延迟 + 自适应降级（连续失败时增加延迟/降低并发）
+        - 低失败阈值（10 次），避免 IP 被封后持续冲击
 
-        反爬说明：当前 IP 被拦截时，财富号 requests 也会返回 403/空响应，
-        继续多线程高频重试只会加重封禁。因此当连续失败达到阈值时，主动
-        暂停并提示用户降低并发或等待解封。
+        反爬说明：财富号文章页比列表页更敏感，因此并发数更低、延迟更长。
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
+        WINDOW_SIZE = 50           # 每批 50 条
+        WINDOW_PAUSE_RANGE = (10, 20)  # 批间暂停 10-20 秒
+        REQUEST_DELAY_RANGE = (0.5, 1.5)  # 请求间延迟 0.5-1.5 秒
+        MAX_CONSECUTIVE_HTTP_FAIL = 10  # 连续失败阈值（降低避免冲击）
+        ADAPTIVE_FAIL_THRESHOLD = 5     # 连续失败 5 次触发降级
+
         total = len(posts)
         print(f'{self.symbol}: 开始多线程爬取 {total} 条财富号帖子...')
+        print(f'{self.symbol}:   策略: 窗口={WINDOW_SIZE}条/批, 批间暂停{WINDOW_PAUSE_RANGE[0]}-{WINDOW_PAUSE_RANGE[1]}s, '
+              f'请求延迟{REQUEST_DELAY_RANGE[0]}-{REQUEST_DELAY_RANGE[1]}s, 并发={max_workers}')
+
+        # Step 1: 浏览器 Cookie 预热（复用 Stage 1 机制）
+        print(f'{self.symbol}:   预热浏览器 cookies...')
+        self._bootstrap_list_session_via_browser()
+        session = self.session  # 已注入 EastMoney cookies
 
         parser = PostParser()
         success_count = 0
         error_count = 0
         consecutive_http_fail = 0
         lock = threading.Lock()
-        # 当连续 HTTP 失败达到该阈值，认为 IP 已被全局拦截，停止继续冲击
-        MAX_CONSECUTIVE_HTTP_FAIL = 50
 
-        def crawl_one(post):
+        # 自适应降级参数
+        current_delay = REQUEST_DELAY_RANGE[0]
+        current_workers = max_workers
+        stage2_start = time.time()
+
+        def crawl_one(post, s):
             nonlocal success_count, error_count, consecutive_http_fail
             post_id = post['_id']
             post_url = post['post_url']
 
-            # 全局拦截检测：避免无意义请求加重封禁
+            # 全局拦截检测
             with lock:
                 if consecutive_http_fail >= MAX_CONSECUTIVE_HTTP_FAIL:
                     return False
 
             try:
-                detail = parser._try_requests_caifuhao(post_url)
+                detail = parser._try_requests_caifuhao(post_url, session=s)
 
                 if detail['post_content']:
                     with lock:
@@ -468,11 +651,8 @@ class PostCrawler(object):
                         if update_callback:
                             update_callback(post_id, update_data)
                         success_count += 1
-                        if success_count % 20 == 0:
-                            print(f'{self.symbol}: 财富号已爬取 {success_count}/{total} 条')
                     return True
                 else:
-                    # 正文为空/文章失效 → 持久记录为失败，后续重跑直接跳过。
                     with lock:
                         consecutive_http_fail += 1
                         if update_callback:
@@ -504,22 +684,64 @@ class PostCrawler(object):
                     error_count += 1
                 return False
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(crawl_one, post) for post in posts]
-            interrupted = False
-            for future in as_completed(futures):
-                future.result()  # 等待所有任务完成
-                with lock:
-                    if consecutive_http_fail >= MAX_CONSECUTIVE_HTTP_FAIL and not interrupted:
-                        print(f'{self.symbol}: 财富号请求连续失败 {consecutive_http_fail} 次，'
-                              f'疑似 IP 已被全局拦截，停止继续爬取。'
-                              f'建议等待一段时间后重试或更换网络环境。')
-                        interrupted = True
-                    processed = success_count + error_count
-                    if processed % 20 == 0 or processed == total:
-                        print(f'{self.symbol}: 财富号进度 {processed}/{total}，成功 {success_count}，失效/失败 {error_count}')
-                if interrupted:
-                    break
+        # Step 2: 窗口分批爬取
+        interrupted = False
+        for window_start in range(0, total, WINDOW_SIZE):
+            if interrupted:
+                break
+
+            window = posts[window_start:window_start + WINDOW_SIZE]
+            window_end = min(window_start + len(window), total)
+
+            with ThreadPoolExecutor(max_workers=current_workers) as executor:
+                window_futures = []
+                for post in window:
+                    with lock:
+                        if consecutive_http_fail >= MAX_CONSECUTIVE_HTTP_FAIL:
+                            break
+                    # 请求间延迟
+                    time.sleep(random.uniform(current_delay, current_delay * 2))
+                    window_futures.append(executor.submit(crawl_one, post, session))
+
+                # 等待窗口内所有任务完成
+                for future in as_completed(window_futures):
+                    future.result()
+                    with lock:
+                        if consecutive_http_fail >= MAX_CONSECUTIVE_HTTP_FAIL and not interrupted:
+                            print(f'{self.symbol}: 财富号请求连续失败 {consecutive_http_fail} 次，'
+                                  f'疑似 IP 已被全局拦截，停止继续爬取。'
+                                  f'建议等待一段时间后重试或更换网络环境。')
+                            interrupted = True
+                        processed = success_count + error_count
+                        if processed % 20 == 0 or processed == total:
+                            elapsed = time.time() - stage2_start
+                            speed = processed / max(elapsed / 60, 0.01)
+                            eta_min = (total - processed) / max(speed, 0.01)
+                            print(f'{self.symbol}: 财富号进度 {processed}/{total} ({processed/total*100:.0f}%) | '
+                                  f'成功 {success_count} | 失败 {error_count} | '
+                                  f'耗时 {elapsed:.0f}s | 速度 {speed:.1f}条/分 | 预计剩余 {eta_min:.0f}分')
+                    if interrupted:
+                        break
+
+            # 自适应降级：连续失败达到阈值时增加延迟、降低并发
+            with lock:
+                if consecutive_http_fail >= ADAPTIVE_FAIL_THRESHOLD and consecutive_http_fail < MAX_CONSECUTIVE_HTTP_FAIL:
+                    old_delay = current_delay
+                    current_delay = min(current_delay * 2, 10.0)
+                    current_workers = max(1, current_workers - 1)
+                    print(f'{self.symbol}: [降级] 连续失败 {consecutive_http_fail} 次，'
+                          f'延迟 {old_delay:.1f}s → {current_delay:.1f}s，并发 {current_workers + 1} → {current_workers}')
+                elif consecutive_http_fail == 0 and current_delay > REQUEST_DELAY_RANGE[0]:
+                    # 恢复：连续成功时逐步恢复参数
+                    current_delay = max(REQUEST_DELAY_RANGE[0], current_delay * 0.8)
+                    current_workers = min(max_workers, current_workers + 1)
+                    print(f'{self.symbol}: [恢复] 延迟 {current_delay:.1f}s，并发 {current_workers}')
+
+            # 窗口间冷却暂停（最后一批不需要）
+            if window_end < total and not interrupted:
+                pause = random.uniform(*WINDOW_PAUSE_RANGE)
+                print(f'{self.symbol}:   窗口 {window_end}/{total} 完成，冷却 {pause:.0f}s...')
+                time.sleep(pause)
 
         print(f'{self.symbol}: 财富号爬取完成，成功 {success_count}，失败 {error_count}')
 
@@ -741,10 +963,15 @@ class PostCrawler(object):
 
         用于快速判断该页是否可能包含 >= start_date 的帖子。
         """
+        parser = PostParser()
         try:
-            dic_list = self._fetch_post_page_fast(page_num)
-        except Exception:
+            dic_list = self.fetch_post_page(page_num, parser, stockbar_name=f'{self.symbol}吧')
+        except Exception as e:
+            if _looks_like_blocked_error(e):
+                raise FullCrawlPaused(page_num, str(e), retry_after_seconds=3600)
             return None, None, 0
+        finally:
+            parser.close()
         dates = [d.get('post_date') for d in dic_list if d.get('post_date')]
         if not dates:
             return None, None, len(dic_list)
@@ -758,7 +985,7 @@ class PostCrawler(object):
         如果第 mid 页的 max_date < start_date，说明 mid 之前（页号更小）才可能有目标帖。
         """
         left, right = 1, max_page
-        boundary = max_page
+        boundary = 0
         probes = 0
         max_probes = 30
         while left <= right and probes < max_probes:
@@ -787,39 +1014,106 @@ class PostCrawler(object):
     def _fetch_page_with_retry(
         self,
         page_num: int,
+        parser: PostParser,
+        stockbar_name: str = '',
         retries: int = 3,
         base_delay: float = 1.0,
     ) -> list:
-        """带指数退避的页面抓取，requests 失败时回退 Selenium。
-
-        注意：回退 Selenium 前会判断失败原因。对于已确认的验证码/验证页，
-        Selenium 一样会被拦截，继续尝试只会浪费资源；直接抛出异常由外层
-        重试逻辑处理，并计入 failed_pages。
-        """
+        """带指数退避的 Selenium 页面抓取。"""
         last_error = None
         for attempt in range(retries + 1):
             try:
-                return self._fetch_post_page_fast(page_num)
+                return self.fetch_post_page(page_num, parser, stockbar_name=stockbar_name)
             except Exception as e:
                 last_error = e
+                if _looks_like_blocked_error(e):
+                    raise RuntimeError(f'page {page_num} blocked by validation: {e}')
                 delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
                 time.sleep(delay)
-                # 如果是验证页，额外长冷却一次
-                if 'fd_guba_validate' in str(e) or '身份核实' in str(e):
-                    print(f'{self.symbol}: 第 {page_num} 页触发验证，暂停 60 秒')
-                    time.sleep(60)
+        raise RuntimeError(f'page {page_num} failed after Selenium retries: {last_error}')
 
-        err_text = str(last_error)
-        # 当 requests 已明确返回验证页时，Selenium 也会被拦截，没必要回退
-        if 'fd_guba_validate' in err_text or '身份核实' in err_text:
-            raise RuntimeError(f'page {page_num} blocked by validation: {last_error}')
-
-        print(f'{self.symbol}: 第 {page_num} 页 requests 连续失败 {retries + 1} 次，回退 Selenium: {last_error}')
+    def _page_date_range(
+        self,
+        page_num: int,
+        list_source: str = 'html',
+        session: requests.Session | None = None,
+    ) -> tuple[str | None, str | None, int]:
         try:
-            parser = PostParser()
-            return self.fetch_post_page(page_num, parser, stockbar_name=f'{self.symbol}吧')
+            if list_source == 'selenium':
+                parser = PostParser()
+                try:
+                    dic_list = self.fetch_post_page(page_num, parser, stockbar_name=f'{self.symbol}吧')
+                finally:
+                    parser.close()
+            else:
+                dic_list = self._fetch_post_page_fast(page_num, session=session)
         except Exception as e:
-            raise RuntimeError(f'page {page_num} failed after requests and selenium fallback: {e}')
+            if _looks_like_blocked_error(e):
+                raise FullCrawlPaused(page_num, str(e), retry_after_seconds=3600)
+            return None, None, 0
+        dates = [d.get('post_date') for d in dic_list if d.get('post_date')]
+        if not dates:
+            return None, None, len(dic_list)
+        return max(dates), min(dates), len(dic_list)
+
+    def _find_boundary_page_since(self, start_date: str, max_page: int, list_source: str = 'html') -> int:
+        left, right = 1, max_page
+        boundary = 0
+        probes = 0
+        max_probes = 30
+        while left <= right and probes < max_probes:
+            mid = (left + right) // 2
+            max_date, min_date, count = self._page_date_range(mid, list_source=list_source, session=self.session)
+            probes += 1
+            if max_date is None or count == 0:
+                right = mid - 1
+                continue
+            if min_date >= start_date:
+                boundary = max(boundary, mid)
+                left = mid + 1
+            elif max_date < start_date:
+                right = mid - 1
+            else:
+                boundary = max(boundary, mid)
+                left = mid + 1
+        print(f'{self.symbol}: boundary probes {probes}, boundary_page={boundary}')
+        return boundary
+
+    def _fetch_page_with_retry(
+        self,
+        page_num: int,
+        parser: PostParser | None = None,
+        stockbar_name: str = '',
+        list_source: str = 'html',
+        session: requests.Session | None = None,
+        allow_selenium_fallback: bool = False,
+        retries: int = 3,
+        base_delay: float = 0.8,
+    ) -> list:
+        last_error = None
+        for attempt in range(retries + 1):
+            try:
+                if list_source == 'selenium':
+                    if parser is None:
+                        parser = PostParser()
+                    return self.fetch_post_page(page_num, parser, stockbar_name=stockbar_name)
+                return self._fetch_post_page_fast(page_num, session=session)
+            except Exception as e:
+                last_error = e
+                if _looks_like_blocked_error(e):
+                    raise RuntimeError(f'page {page_num} blocked by validation: {e}')
+                if attempt < retries:
+                    delay = base_delay * (2 ** attempt) + random.uniform(0, 0.8)
+                    time.sleep(delay)
+        if allow_selenium_fallback and list_source != 'selenium':
+            fallback_parser = PostParser()
+            try:
+                return self.fetch_post_page(page_num, fallback_parser, stockbar_name=stockbar_name or f'{self.symbol}吧')
+            except Exception as e:
+                raise RuntimeError(f'page {page_num} failed after requests and Selenium fallback: {e}')
+            finally:
+                fallback_parser.close()
+        raise RuntimeError(f'page {page_num} failed after requests retries: {last_error}')
 
     def crawl_post_info_since(
         self,
@@ -827,106 +1121,555 @@ class PostCrawler(object):
         storage_callback,
         list_workers: int = 6,
         checkpoint_callback=None,
+        page_storage_callback=None,
+        cached_pages: set[int] | None = None,
+        boundary_page: int | None = None,
+        list_window_size: int = 30,
+        window_pause_range: tuple[float, float] = (20.0, 45.0),
+        list_source: str = "html",
+        api_page_size: int = 80,
+        api_window_size: int = 60,
+        api_concurrency: int = 3,
+        target_stage1_minutes: int = 25,
     ) -> dict:
         """从网页全量抓取 post_publish_time >= start_date 的帖子列表。
 
         Args:
             start_date: 起始日期（YYYY-MM-DD），包含该日期。
             storage_callback: 每页数据回调，接收 dic_list（已按 start_date 过滤）。
-            list_workers: 并发抓取页数。
+            list_workers: 兼容旧参数；上游 Selenium 方法按单浏览器顺序翻页。
             checkpoint_callback: 可选回调，每处理完一页调用一次，参数为 (page_num, result)。
+            page_storage_callback: 可选页级缓存回调，参数为 (page_num, rows, meta)。
+            cached_pages: 已有 ok 页缓存的页码集合；这些页会跳过网络请求。
+            boundary_page: 已缓存的边界页；传入时跳过本轮边界探测。
+            list_window_size: 兼容旧参数；仅用于进度日志。
+            window_pause_range: 兼容旧参数；不再用于并发滑窗。
 
         Returns:
             汇总信息 dict，包含 max_page, boundary_page, completed_pages, failed_pages,
             rows, unique_post_ids, min_time, max_time 等。
         """
-        print(f'\n{self.symbol}: 开始全量爬取列表，start_date={start_date}')
-        max_page = self.get_page_num()
+        if list_source != 'html':
+            print(f'{self.symbol}: 已恢复为上游 Selenium HTML 抓取，忽略 list_source={list_source}')
+        print(f'\n{self.symbol}: 开始全量爬取列表，start_date={start_date}, list_source=html')
+        cached_pages = set(cached_pages or set())
+        list_window_size = max(1, int(list_window_size or 30))
+
+        try:
+            max_page = self.get_page_num()
+        except FullCrawlPaused as e:
+            end = time.time()
+            return {
+                'status': 'paused_blocked',
+                'max_page': 0,
+                'boundary_page': 0,
+                'completed_pages': 0,
+                'failed_pages': [e.page_num],
+                'blocked_pages': [e.page_num],
+                'parse_failed_pages': [],
+                'transient_failed_pages': [],
+                'paused_reason': e.reason,
+                'retry_after_seconds': e.retry_after_seconds,
+                'skipped_cached_pages': 0,
+                'list_window_size': list_window_size,
+                'list_source': 'html',
+                'rows': 0,
+                'unique_post_ids': 0,
+                'min_time': '',
+                'max_time': '',
+                'time_cost_seconds': round(end - self.start, 2),
+            }
         print(f'{self.symbol}: 列表总页数 {max_page}')
 
-        boundary_page = self._find_boundary_page_since(start_date, max_page)
+        status = 'success'
+        blocked_pages: list[int] = []
+        transient_failed_pages: list[int] = []
+        paused_reason = ''
+        retry_after_seconds = 0
+
+        if boundary_page is None:
+            try:
+                boundary_page = self._find_boundary_page_since(start_date, max_page)
+            except FullCrawlPaused as e:
+                boundary_page = 0
+                status = 'paused_blocked'
+                blocked_pages.append(e.page_num)
+                paused_reason = e.reason
+                retry_after_seconds = e.retry_after_seconds
+        else:
+            boundary_page = min(max(0, int(boundary_page)), max_page)
+            print(f'{self.symbol}: 复用边界页 {boundary_page}')
+        if boundary_page == 0 and status == 'success':
+            status = 'paused_blocked'
+            blocked_pages.append(1)
+            paused_reason = 'boundary detection failed'
+            retry_after_seconds = 3600
         print(f'{self.symbol}: 需抓取 1 ~ {boundary_page} 页')
 
-        completed_pages = 0
+        completed_pages = len([p for p in cached_pages if 1 <= p <= boundary_page])
         failed_pages: list[int] = []
         total_rows = 0
         seen_ids: set[str] = set()
         min_time = None
         max_time = None
 
-        def _process_page(page_num: int) -> tuple[int, list]:
-            try:
-                time.sleep(abs(random.normalvariate(0.05, 0.03)))
-                dic_list = self._fetch_page_with_retry(page_num)
-                # 只保留 >= start_date 的帖子
-                kept = [d for d in dic_list if d.get('post_date') and d['post_date'] >= start_date]
-                # 停止条件：整页都 < start_date（说明已经越过边界）
-                all_before = dic_list and all(d.get('post_date', '') < start_date for d in dic_list if d.get('post_date'))
-                return page_num, kept, all_before
-            except Exception as e:
-                print(f'{self.symbol}: 第 {page_num} 页处理失败: {e}')
-                return page_num, [], False
-
-        # 按 chunk 并发：每批最多 300 页，避免一次性塞爆线程池和内存
-        CHUNK_SIZE = 300
-        pages = list(range(1, boundary_page + 1))
-        chunk_idx = 0
-        for i in range(0, len(pages), CHUNK_SIZE):
-            chunk = pages[i:i + CHUNK_SIZE]
-            chunk_idx += 1
-            print(f'{self.symbol}: 并发抓取第 {chunk_idx} 批，页面 {chunk[0]}~{chunk[-1]}')
-            results = []
-            with ThreadPoolExecutor(max_workers=list_workers) as executor:
-                futures = {executor.submit(_process_page, p): p for p in chunk}
-                for future in as_completed(futures):
-                    page_num, kept, all_before = future.result()
-                    if not kept and not all_before and page_num <= boundary_page:
-                        # 既没有保留数据也不是正常越过边界，计入失败
-                        failed_pages.append(page_num)
-                    else:
-                        failed_pages = [p for p in failed_pages if p != page_num]
-                        if kept:
-                            # 去重并统计
-                            unique_kept = []
-                            for d in kept:
-                                pid = str(d.get('_id', ''))
-                                if pid and pid not in seen_ids:
-                                    seen_ids.add(pid)
-                                    unique_kept.append(d)
-                            if unique_kept:
-                                storage_callback(unique_kept)
-                                total_rows += len(unique_kept)
-                                dates = [d['post_date'] for d in unique_kept if d.get('post_date')]
-                                times = [f"{d['post_date']} {d.get('post_time', '')}".strip() for d in unique_kept]
-                                if dates:
-                                    local_min = min(dates)
-                                    local_max = max(dates)
-                                    if min_time is None or local_min < min_time:
-                                        min_time = local_min
-                                    if max_time is None or local_max > max_time:
-                                        max_time = local_max
-                        completed_pages += 1
-                        if checkpoint_callback:
-                            checkpoint_callback(page_num, {"kept": len(kept), "all_before": all_before})
-                    if all_before:
-                        print(f'{self.symbol}: 第 {page_num} 页全部 < {start_date}，提前结束')
+        pages = [p for p in range(1, boundary_page + 1) if p not in cached_pages]
+        parser = PostParser()
+        stockbar_name = self._extract_stockbar_name()
+        progress_interval = max(1, min(5, len(pages) // 20))  # report every ~5% or at least every 5 pages
+        last_progress_at = 0
+        try:
+            for idx, page_num in enumerate(pages, start=1):
+                if status == 'paused_blocked':
+                    break
+                time.sleep(abs(random.normalvariate(0.01, 0.005)))
+                try:
+                    dic_list = self._fetch_page_with_retry(
+                        page_num,
+                        parser,
+                        stockbar_name=stockbar_name,
+                    )
+                except Exception as e:
+                    failed_pages.append(page_num)
+                    if _looks_like_blocked_error(e):
+                        status = 'paused_blocked'
+                        blocked_pages.append(page_num)
+                        paused_reason = str(e)
+                        retry_after_seconds = 3600
+                        print(f'{self.symbol}: [STOP] 第 {page_num} 页触发验证/限流 → {e}')
+                        if hasattr(self, 'browser') and self.browser is not None:
+                            try:
+                                from browser_utils import session_blocked_screenshot_path
+                                self.browser.save_screenshot(str(session_blocked_screenshot_path(self.symbol)))
+                                print(f'{self.symbol}: [截图] 已保存验证页截图')
+                            except Exception:
+                                pass
                         break
-            print(f'{self.symbol}: 第 {chunk_idx} 批完成，累计 {completed_pages} 页，{total_rows} 条')
+                    transient_failed_pages.append(page_num)
+                    print(f'{self.symbol}: [失败] 第 {page_num} 页 → {type(e).__name__}: {e}')
+                    continue
+
+                kept = [
+                    d for d in dic_list
+                    if d.get('post_date') and d['post_date'] >= start_date
+                ]
+                all_before = bool(dic_list) and all(
+                    d.get('post_date', '') < start_date
+                    for d in dic_list
+                    if d.get('post_date')
+                )
+
+                if not kept and not all_before:
+                    failed_pages.append(page_num)
+                    print(f'{self.symbol}: [空页] 第 {page_num} 页无有效数据（非首页空页）')
+                else:
+                    failed_pages = [p for p in failed_pages if p != page_num]
+                    unique_kept = []
+                    for d in kept:
+                        pid = str(d.get('_id', ''))
+                        if pid and pid not in seen_ids:
+                            seen_ids.add(pid)
+                            unique_kept.append(d)
+                    if unique_kept:
+                        if storage_callback:
+                            storage_callback(unique_kept)
+                        if page_storage_callback:
+                            page_storage_callback(page_num, unique_kept, {"status": "ok"})
+                        total_rows += len(unique_kept)
+                        dates = [d['post_date'] for d in unique_kept if d.get('post_date')]
+                        if dates:
+                            local_min = min(dates)
+                            local_max = max(dates)
+                            if min_time is None or local_min < min_time:
+                                min_time = local_min
+                            if max_time is None or local_max > max_time:
+                                max_time = local_max
+                    completed_pages += 1
+                    if checkpoint_callback:
+                        checkpoint_callback(page_num, {"kept": len(kept), "all_before": all_before})
+
+                # Real-time progress: report every progress_interval pages or on every page after 50% done
+                elapsed = time.time() - self.start
+                if (idx - last_progress_at >= progress_interval) or (idx == len(pages)):
+                    pct = idx / max(len(pages), 1) * 100
+                    speed = idx / max(elapsed / 60, 0.01)
+                    eta_min = max(0, (len(pages) - idx) / max(speed, 0.01))
+                    status_icon = "[OK]" if not failed_pages else f"[WARN:{len(failed_pages)}]"
+                    print(f'{self.symbol}: {status_icon} 进度 {idx}/{len(pages)} 页 ({pct:.0f}%) | '
+                          f'成功 {completed_pages} 页 | 累计 {total_rows} 条 | '
+                          f'耗时 {elapsed:.0f}s | 速度 {speed:.1f}页/分 | 预计剩余 {eta_min:.0f}分')
+                    last_progress_at = idx
+
+                if all_before:
+                    boundary_page = min(boundary_page, max(0, page_num - 1))
+                    print(f'{self.symbol}: [完成] 第 {page_num} 页全部早于 {start_date}，提前结束')
+                    break
+        finally:
+            parser.close()
+            if getattr(self, 'browser', None) is not None:
+                self.browser.quit()
 
         end = time.time()
         time_cost = end - self.start
         summary = {
+            'status': status,
             'max_page': max_page,
             'boundary_page': boundary_page,
             'completed_pages': completed_pages,
             'failed_pages': sorted(set(failed_pages)),
+            'blocked_pages': sorted(set(blocked_pages)),
+            'parse_failed_pages': [],
+            'transient_failed_pages': sorted(set(transient_failed_pages)),
+            'paused_reason': paused_reason,
+            'retry_after_seconds': retry_after_seconds,
+            'skipped_cached_pages': len([p for p in cached_pages if 1 <= p <= boundary_page]),
+            'list_window_size': list_window_size,
+            'list_source': 'html',
             'rows': total_rows,
             'unique_post_ids': len(seen_ids),
             'min_time': min_time or '',
             'max_time': max_time or '',
             'time_cost_seconds': round(time_cost, 2),
         }
-        print(f'{self.symbol}: 全量列表爬取完成，{summary}')
+        # Clear final summary
+        print(f'\n{self.symbol}: {"="*50}')
+        print(f'{self.symbol}: 全量列表爬取完成')
+        print(f'{self.symbol}: {"="*50}')
+        print(f'{self.symbol}:   状态: {status}')
+        print(f'{self.symbol}:   总页数: {max_page} | 边界页: {boundary_page}')
+        print(f'{self.symbol}:   成功: {completed_pages} 页 | 跳过缓存: {summary["skipped_cached_pages"]} 页')
+        print(f'{self.symbol}:   帖子: {total_rows} 条 | 唯一ID: {summary["unique_post_ids"]}')
+        if min_time and max_time:
+            print(f'{self.symbol}:   时间范围: {min_time} ~ {max_time}')
+        print(f'{self.symbol}:   总耗时: {time_cost:.0f}s ({time_cost/60:.1f}分)')
+        if failed_pages:
+            print(f'{self.symbol}:   [错误] 失败页: {sorted(set(failed_pages))} ({len(failed_pages)}页)')
+        if blocked_pages:
+            print(f'{self.symbol}:   [错误] 被限流页: {blocked_pages}')
+        if transient_failed_pages:
+            print(f'{self.symbol}:   [警告] 瞬时失败: {sorted(set(transient_failed_pages))} ({len(transient_failed_pages)}页)')
+        if paused_reason:
+            print(f'{self.symbol}:   [原因] {paused_reason}')
+        if status == 'paused_blocked':
+            print(f'{self.symbol}:   [提示] 请先运行 --manual-verify 完成验证，再重新执行 Stage 1 断点续爬')
+        print(f'{self.symbol}: {"="*50}')
+        return summary
+
+
+    def crawl_post_info_since(
+        self,
+        start_date: str,
+        storage_callback,
+        list_workers: int = 6,
+        checkpoint_callback=None,
+        page_storage_callback=None,
+        cached_pages: set[int] | None = None,
+        boundary_page: int | None = None,
+        list_window_size: int = 80,
+        window_pause_range: tuple[float, float] = (3.0, 8.0),
+        list_source: str = "html",
+        api_page_size: int = 80,
+        api_window_size: int = 60,
+        api_concurrency: int = 3,
+        target_stage1_minutes: int = 25,
+        page_limit: int | None = None,
+    ) -> dict:
+        effective_source = 'selenium' if list_source == 'selenium' else 'html'
+        if list_source in {'api', 'auto'}:
+            print(f'{self.symbol}: list_source={list_source} uses fast requests HTML path')
+        print(f'\n{self.symbol}: start full list crawl, start_date={start_date}, list_source={effective_source}')
+
+        cached_pages = set(cached_pages or set())
+        list_window_size = max(1, int(list_window_size or 80))
+        list_workers = max(1, int(list_workers or 1))
+        if effective_source == 'selenium':
+            list_workers = 1
+
+        try:
+            max_page = self.get_page_num()
+        except FullCrawlPaused as e:
+            end = time.time()
+            return {
+                'status': 'paused_blocked',
+                'max_page': 0,
+                'boundary_page': 0,
+                'completed_pages': 0,
+                'failed_pages': [e.page_num],
+                'blocked_pages': [e.page_num],
+                'parse_failed_pages': [],
+                'transient_failed_pages': [],
+                'paused_reason': e.reason,
+                'retry_after_seconds': e.retry_after_seconds,
+                'skipped_cached_pages': 0,
+                'list_window_size': list_window_size,
+                'list_workers': list_workers,
+                'list_source': effective_source,
+                'partial': bool(page_limit),
+                'page_limit': page_limit or 0,
+                'rows': 0,
+                'unique_post_ids': 0,
+                'min_time': '',
+                'max_time': '',
+                'time_cost_seconds': round(end - self.start, 2),
+            }
+        print(f'{self.symbol}: max_page={max_page}')
+
+        partial = bool(page_limit)
+        if page_limit:
+            boundary_page = min(max_page, max(1, int(page_limit)))
+            print(f'{self.symbol}: trial page_limit={page_limit}, crawl pages 1~{boundary_page}')
+        elif boundary_page is None:
+            try:
+                boundary_page = self._find_boundary_page_since(start_date, max_page, list_source=effective_source)
+            except FullCrawlPaused as e:
+                end = time.time()
+                return {
+                    'status': 'paused_blocked',
+                    'max_page': max_page,
+                    'boundary_page': 0,
+                    'completed_pages': 0,
+                    'failed_pages': [e.page_num],
+                    'blocked_pages': [e.page_num],
+                    'parse_failed_pages': [],
+                    'transient_failed_pages': [],
+                    'paused_reason': e.reason,
+                    'retry_after_seconds': e.retry_after_seconds,
+                    'skipped_cached_pages': 0,
+                    'list_window_size': list_window_size,
+                    'list_workers': list_workers,
+                    'list_source': effective_source,
+                    'partial': partial,
+                    'page_limit': page_limit or 0,
+                    'rows': 0,
+                    'unique_post_ids': 0,
+                    'min_time': '',
+                    'max_time': '',
+                    'time_cost_seconds': round(end - self.start, 2),
+                }
+        else:
+            boundary_page = min(max(0, int(boundary_page)), max_page)
+            print(f'{self.symbol}: reuse boundary_page={boundary_page}')
+
+        if not boundary_page:
+            end = time.time()
+            return {
+                'status': 'paused_blocked',
+                'max_page': max_page,
+                'boundary_page': 0,
+                'completed_pages': 0,
+                'failed_pages': [1],
+                'blocked_pages': [1],
+                'parse_failed_pages': [],
+                'transient_failed_pages': [],
+                'paused_reason': 'boundary detection failed',
+                'retry_after_seconds': 3600,
+                'skipped_cached_pages': 0,
+                'list_window_size': list_window_size,
+                'list_workers': list_workers,
+                'list_source': effective_source,
+                'partial': partial,
+                'page_limit': page_limit or 0,
+                'rows': 0,
+                'unique_post_ids': 0,
+                'min_time': '',
+                'max_time': '',
+                'time_cost_seconds': round(end - self.start, 2),
+            }
+
+        print(f'{self.symbol}: crawl page range 1~{boundary_page}')
+
+        completed_pages = len([p for p in cached_pages if 1 <= p <= boundary_page])
+        failed_pages: set[int] = set()
+        blocked_pages: set[int] = set()
+        transient_failed_pages: set[int] = set()
+        seen_ids: set[str] = set()
+        total_rows = 0
+        min_time = None
+        max_time = None
+        pages = [p for p in range(1, boundary_page + 1) if p not in cached_pages]
+        total_to_fetch = len(pages)
+        thread_local = threading.local()
+        base_cookies = self.session.cookies.get_dict()
+
+        def session_for_thread() -> requests.Session:
+            session = getattr(thread_local, 'session', None)
+            if session is None:
+                session = self._new_list_session(base_cookies)
+                thread_local.session = session
+            return session
+
+        def fetch_job(page_num: int, allow_fallback: bool = False) -> dict:
+            try:
+                time.sleep(random.uniform(0.02, 0.18))
+                parser = PostParser() if effective_source == 'selenium' else None
+                try:
+                    dic_list = self._fetch_page_with_retry(
+                        page_num,
+                        parser=parser,
+                        stockbar_name=f'{self.symbol}吧',
+                        list_source=effective_source,
+                        session=session_for_thread(),
+                        allow_selenium_fallback=allow_fallback,
+                    )
+                finally:
+                    if parser is not None:
+                        parser.close()
+                kept = [
+                    d for d in dic_list
+                    if d.get('post_date') and d['post_date'] >= start_date
+                ]
+                all_before = bool(dic_list) and all(
+                    d.get('post_date', '') < start_date
+                    for d in dic_list
+                    if d.get('post_date')
+                )
+                if not kept and not all_before:
+                    raise RuntimeError('empty parsed page')
+                return {'page': page_num, 'ok': True, 'kept': kept, 'all_before': all_before}
+            except Exception as e:
+                return {
+                    'page': page_num,
+                    'ok': False,
+                    'kept': [],
+                    'all_before': False,
+                    'blocked': _looks_like_blocked_error(e),
+                    'error': f'{type(e).__name__}: {e}',
+                }
+
+        def record_success(page_num: int, kept: list, all_before: bool):
+            nonlocal completed_pages, total_rows, min_time, max_time, boundary_page
+            failed_pages.discard(page_num)
+            blocked_pages.discard(page_num)
+            transient_failed_pages.discard(page_num)
+            unique_kept = []
+            for d in kept:
+                pid = str(d.get('_id', ''))
+                if pid and pid not in seen_ids:
+                    seen_ids.add(pid)
+                    unique_kept.append(d)
+            if unique_kept:
+                if storage_callback:
+                    storage_callback(unique_kept)
+                if page_storage_callback:
+                    page_storage_callback(page_num, unique_kept, {
+                        'status': 'ok',
+                        'list_source': effective_source,
+                    })
+                total_rows += len(unique_kept)
+                dates = [d['post_date'] for d in unique_kept if d.get('post_date')]
+                if dates:
+                    local_min = min(dates)
+                    local_max = max(dates)
+                    if min_time is None or local_min < min_time:
+                        min_time = local_min
+                    if max_time is None or local_max > max_time:
+                        max_time = local_max
+            completed_pages += 1
+            if checkpoint_callback:
+                checkpoint_callback(page_num, {'kept': len(kept), 'all_before': all_before})
+            if all_before and not partial:
+                boundary_page = min(boundary_page, max(0, page_num - 1))
+
+        def run_pass(page_list: list[int], workers: int, label: str, allow_fallback: bool = False) -> set[int]:
+            if not page_list:
+                return set()
+            workers = max(1, min(workers, len(page_list)))
+            print(f'{self.symbol}: {label}, pages={len(page_list)}, workers={workers}')
+            pass_failed: set[int] = set()
+            fetched_in_pass = 0
+            for start in range(0, len(page_list), list_window_size):
+                window = page_list[start:start + list_window_size]
+                if effective_source == 'selenium':
+                    workers = 1
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    futures = {
+                        executor.submit(fetch_job, page_num, allow_fallback): page_num
+                        for page_num in window
+                    }
+                    for future in as_completed(futures):
+                        result = future.result()
+                        page_num = result['page']
+                        fetched_in_pass += 1
+                        if result.get('ok'):
+                            record_success(page_num, result['kept'], result['all_before'])
+                        else:
+                            failed_pages.add(page_num)
+                            pass_failed.add(page_num)
+                            if result.get('blocked'):
+                                blocked_pages.add(page_num)
+                            else:
+                                transient_failed_pages.add(page_num)
+                            if len(pass_failed) <= 5:
+                                print(f'{self.symbol}: page {page_num} failed in {label}: {result.get("error")}')
+
+                elapsed = time.time() - self.start
+                done_now = completed_pages - len([p for p in cached_pages if 1 <= p <= boundary_page])
+                speed = max(done_now, 1) / max(elapsed / 60, 0.01)
+                eta_min = max(0, (total_to_fetch - done_now) / max(speed, 0.01))
+                status_icon = '[OK]' if not failed_pages else f'[WARN:{len(failed_pages)}]'
+                print(f'{self.symbol}: {status_icon} progress {completed_pages}/{boundary_page} pages | '
+                      f'new_rows {total_rows} | elapsed {elapsed:.0f}s | speed {speed:.1f} pages/min | '
+                      f'eta {eta_min:.0f} min')
+
+                if start + list_window_size < len(page_list):
+                    low, high = window_pause_range
+                    time.sleep(random.uniform(max(0, low), max(low, high)))
+            return pass_failed
+
+        first_failed = run_pass(pages, list_workers, 'pass1-fast', allow_fallback=False)
+        if first_failed:
+            retry_workers = max(1, list_workers // 2)
+            second_failed = run_pass(sorted(first_failed), retry_workers, 'retry-lower-concurrency', allow_fallback=False)
+        else:
+            second_failed = set()
+        if second_failed:
+            run_pass(sorted(second_failed), 1, 'retry-single-with-fallback', allow_fallback=True)
+
+        status = 'success'
+        paused_reason = ''
+        retry_after_seconds = 0
+        if blocked_pages:
+            status = 'paused_blocked'
+            paused_reason = 'blocked by validation after retries'
+            retry_after_seconds = 3600
+        elif failed_pages:
+            status = 'partial_failed'
+            paused_reason = 'some pages failed after retries'
+
+        if getattr(self, 'browser', None) is not None:
+            try:
+                self.browser.quit()
+            except Exception:
+                pass
+
+        end = time.time()
+        time_cost = end - self.start
+        summary = {
+            'status': status,
+            'max_page': max_page,
+            'boundary_page': boundary_page,
+            'completed_pages': completed_pages,
+            'failed_pages': sorted(failed_pages),
+            'blocked_pages': sorted(blocked_pages),
+            'parse_failed_pages': [],
+            'transient_failed_pages': sorted(transient_failed_pages),
+            'paused_reason': paused_reason,
+            'retry_after_seconds': retry_after_seconds,
+            'skipped_cached_pages': len([p for p in cached_pages if 1 <= p <= boundary_page]),
+            'list_window_size': list_window_size,
+            'list_workers': list_workers,
+            'list_source': effective_source,
+            'partial': partial,
+            'page_limit': page_limit or 0,
+            'rows': total_rows,
+            'unique_post_ids': len(seen_ids),
+            'min_time': min_time or '',
+            'max_time': max_time or '',
+            'time_cost_seconds': round(time_cost, 2),
+        }
+        print(f'\n{self.symbol}: full list crawl done, status={status}, '
+              f'completed={completed_pages}, failed={summary["failed_pages"]}, '
+              f'blocked={summary["blocked_pages"]}, rows={total_rows}, seconds={time_cost:.1f}')
         return summary
 
 
