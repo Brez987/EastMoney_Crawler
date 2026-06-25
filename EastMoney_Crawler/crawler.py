@@ -570,7 +570,7 @@ class PostCrawler(object):
 
         # 先爬财富号帖子（多线程 requests）
         if caifuhao_posts:
-            self._crawl_caifuhao_posts(caifuhao_posts, update_callback, max_workers=max(1, worker_count // 2))
+            self._crawl_caifuhao_posts(caifuhao_posts, update_callback, max_workers=worker_count)
 
         # 爬非财富号帖子
         if guba_posts:
@@ -590,13 +590,14 @@ class PostCrawler(object):
         - 请求间延迟 + 自适应降级（连续失败时增加延迟/降低并发）
         - 低失败阈值（10 次），避免 IP 被封后持续冲击
 
-        反爬说明：财富号文章页比列表页更敏感，因此并发数更低、延迟更长。
+        反爬说明：财富号文章页比列表页更敏感，通过窗口分批+请求延迟+自适应降级控制风险。
+        自适应降级确保出错时自动减速，恢复后逐步提速，兼顾速度与稳定性。
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        WINDOW_SIZE = 50           # 每批 50 条
-        WINDOW_PAUSE_RANGE = (10, 20)  # 批间暂停 10-20 秒
-        REQUEST_DELAY_RANGE = (0.5, 1.5)  # 请求间延迟 0.5-1.5 秒
+        WINDOW_SIZE = 80           # 每批 80 条
+        WINDOW_PAUSE_RANGE = (8, 12)  # 批间暂停 8-12 秒
+        REQUEST_DELAY_RANGE = (0.3, 0.8)  # 请求间延迟 0.3-0.8 秒
         MAX_CONSECUTIVE_HTTP_FAIL = 10  # 连续失败阈值（降低避免冲击）
         ADAPTIVE_FAIL_THRESHOLD = 5     # 连续失败 5 次触发降级
 
