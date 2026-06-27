@@ -84,6 +84,8 @@ class PostCrawler(object):
         self.session = self._new_list_session()
         self._cookie_bootstrap_lock = threading.Lock()
         self._browser_cookie_bootstrapped = False
+        self._caifuhao_session = None
+        self._caifuhao_cookie_bootstrapped = False
 
     def _request_proxies(self) -> dict | None:
         if not self.proxy:
@@ -95,6 +97,27 @@ class PostCrawler(object):
         session.headers.update(self.LIST_HEADERS)
         if cookies:
             session.cookies.update(cookies)
+        return session
+
+    def _new_caifuhao_session(self):
+        """创建 curl_cffi Session（Chrome 120 TLS 指纹）用于财富号爬取"""
+        from curl_cffi import requests as curl_requests
+        session = curl_requests.Session(impersonate="chrome120")
+        session.headers.update({
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,'
+                      'image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Referer': 'https://guba.eastmoney.com/',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'same-site',
+            'Sec-Fetch-User': '?1',
+        })
+        if self.proxy:
+            session.proxies.update({'http': self.proxy, 'https': self.proxy})
         return session
 
     def create_webdriver(self):
@@ -317,6 +340,30 @@ class PostCrawler(object):
                         self.session.cookies.set(name, value, domain='.eastmoney.com')
                 self._browser_cookie_bootstrapped = True
                 print(f'{self.symbol}: warmed requests cookies from browser once')
+            finally:
+                browser.quit()
+
+    def _bootstrap_caifuhao_session_via_browser(self):
+        """启动浏览器访问财富号首页，将 Cookie 注入 curl_cffi Session"""
+        with self._cookie_bootstrap_lock:
+            if self._caifuhao_cookie_bootstrapped and self._caifuhao_session is not None:
+                return
+            browser = create_stealth_chrome()
+            try:
+                browser.get('https://caifuhao.eastmoney.com/')
+                time.sleep(3)
+                browser.get('https://caifuhao.eastmoney.com/news/')
+                time.sleep(2)
+                if self._caifuhao_session is None:
+                    self._caifuhao_session = self._new_caifuhao_session()
+                for cookie in browser.get_cookies():
+                    name = cookie.get('name')
+                    value = cookie.get('value')
+                    domain = cookie.get('domain', '.eastmoney.com')
+                    if name and value is not None:
+                        self._caifuhao_session.cookies.set(name, value, domain=domain)
+                self._caifuhao_cookie_bootstrapped = True
+                print(f'{self.symbol}: warmed caifuhao curl_cffi session from browser')
             finally:
                 browser.quit()
 
@@ -562,7 +609,7 @@ class PostCrawler(object):
         guba_posts = [p for p in posts_to_crawl if 'caifuhao' not in p.get('post_url', '')]
 
         print(f'{self.symbol}: 共 {total} 条帖子待爬取')
-        print(f'  - 财富号: {len(caifuhao_posts)} 条（多线程 requests）')
+        print(f'  - 财富号: {len(caifuhao_posts)} 条（WAP API 主路径 + curl_cffi 兜底）')
         if worker_count > 1:
             print(f'  - 股吧原生: {len(guba_posts)} 条（{worker_count} worker 并发）')
         else:
@@ -581,170 +628,224 @@ class PostCrawler(object):
 
         print(f'{self.symbol}: 正文爬取完成，共处理 {total} 条帖子')
 
-    def _crawl_caifuhao_posts(self, posts: list, update_callback, max_workers: int = 1):
-        """多线程爬取财富号帖子（窗口分批 + 请求延迟 + 自适应降级）
+    def _crawl_caifuhao_posts(self, posts: list, update_callback, max_workers: int = 3):
+        """高速财富号正文爬取（WAP API 主路径 + curl_cffi 兜底 + 窗口分批）
 
-        借鉴 Stage 1 fast HTML 的成功经验：
-        - 浏览器 Cookie 预热 → 共享 Session 伪装身份
-        - 窗口分批（WINDOW_SIZE 条/批），批间冷却暂停
-        - 请求间延迟 + 自适应降级（连续失败时增加延迟/降低并发）
-        - 低失败阈值（10 次），避免 IP 被封后持续冲击
-
-        反爬说明：财富号文章页比列表页更敏感，通过窗口分批+请求延迟+自适应降级控制风险。
-        自适应降级确保出错时自动减速，恢复后逐步提速，兼顾速度与稳定性。
+        主路径：gbapi.eastmoney.com WAP API（低封禁风险，实测 100/100 成功）
+        兜底：curl_cffi Chrome 120 TLS 指纹请求 PC 页面
+        每 worker 独立 curl_cffi Session，不共享，避免连接池竞争。
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        WINDOW_SIZE = 80           # 每批 80 条
-        WINDOW_PAUSE_RANGE = (8, 12)  # 批间暂停 8-12 秒
-        REQUEST_DELAY_RANGE = (0.3, 0.8)  # 请求间延迟 0.3-0.8 秒
-        MAX_CONSECUTIVE_HTTP_FAIL = 10  # 连续失败阈值（降低避免冲击）
-        ADAPTIVE_FAIL_THRESHOLD = 5     # 连续失败 5 次触发降级
-
         total = len(posts)
-        print(f'{self.symbol}: 开始多线程爬取 {total} 条财富号帖子...')
-        print(f'{self.symbol}:   策略: 窗口={WINDOW_SIZE}条/批, 批间暂停{WINDOW_PAUSE_RANGE[0]}-{WINDOW_PAUSE_RANGE[1]}s, '
-              f'请求延迟{REQUEST_DELAY_RANGE[0]}-{REQUEST_DELAY_RANGE[1]}s, 并发={max_workers}')
+        WINDOW_SIZE = 50          # 每批 50 条
+        WORKERS = max(1, min(int(max_workers or 3), 6))
+        WINDOW_PAUSE = (2.0, 5.0)   # 批间暂停
+        PER_REQ_DELAY = (0.1, 0.4)  # 请求间微延迟
+        BLOCK_THRESHOLD = 3         # 连续 403/blocked 触发冷却
+        COOLDOWN_TIME = (30.0, 60.0)  # 封禁后冷却
 
-        # Step 1: 浏览器 Cookie 预热（复用 Stage 1 机制）
-        print(f'{self.symbol}:   预热浏览器 cookies...')
-        self._bootstrap_list_session_via_browser()
-        session = self.session  # 已注入 EastMoney cookies
-
+        # 浏览器预热主 Cookie 池（仅一次，供所有 worker 复制）
+        self._bootstrap_caifuhao_session_via_browser()
+        master_cookies = list(self._caifuhao_session.cookies)
         parser = PostParser()
-        success_count = 0
-        error_count = 0
-        consecutive_http_fail = 0
+
+        def extract_source_id(post: dict) -> str:
+            source_id = str(post.get('post_source_id', '') or '').strip()
+            if source_id:
+                return source_id
+            match = re.search(r'/news/(\d+)', post.get('post_url', '') or '')
+            return match.group(1) if match else ''
+
+        def caifuhao_url(post: dict) -> str:
+            source_id = extract_source_id(post)
+            if source_id:
+                return f'https://caifuhao.eastmoney.com/news/{source_id}'
+            return str(post.get('post_url', '') or '')
+
+        # 每 worker 独立 session（线程本地存储）
+        _thread_local = threading.local()
+
+        def _worker_session():
+            if getattr(_thread_local, 'session', None) is None:
+                s = self._new_caifuhao_session()
+                for c in master_cookies:
+                    try:
+                        s.cookies.set(c.name, c.value, domain=c.domain)
+                    except Exception:
+                        pass
+                _thread_local.session = s
+            return _thread_local.session
+
+        success_ids = set()
+        permanent_fail_ids = set()
+        blocked_ids = set()
         lock = threading.Lock()
+        start_time = time.time()
+        consecutive_blocks = 0
 
-        # 自适应降级参数
-        current_delay = REQUEST_DELAY_RANGE[0]
-        current_workers = max_workers
-        stage2_start = time.time()
+        # 永久失效原因：文章确实不存在/已删除
+        PERMANENT_FAIL_REASONS = {
+            'http_404', 'http_410', 'invalid_article', 'invalid_page_marker',
+            'missing_source_id', 'missing_post_id',
+        }
+        # 可重试原因：临时封禁/超时/空正文
+        RETRYABLE_REASONS = {
+            'http_403', 'http_429', 'blocked_validation', 'timeout',
+            'body_not_found', 'wap_system_busy', 'wap_api_empty',
+        }
 
-        def crawl_one(post, s):
-            nonlocal success_count, error_count, consecutive_http_fail
+        def crawl_one(post: dict):
+            """单条爬取：WAP API 主路径 → curl_cffi PC 页面兜底"""
             post_id = post['_id']
-            post_url = post['post_url']
+            source_id = extract_source_id(post)
+            url = caifuhao_url(post)
+            if not url and not source_id:
+                return post_id, {'ok': False, 'reason': 'missing_url', 'http_status': 0}, url
 
-            # 全局拦截检测
-            with lock:
-                if consecutive_http_fail >= MAX_CONSECUTIVE_HTTP_FAIL:
-                    return False
+            time.sleep(random.uniform(*PER_REQ_DELAY))
+            ws = _worker_session()
 
-            try:
-                detail = parser._try_requests_caifuhao(post_url, session=s)
+            # === 主路径：WAP API（gbapi.eastmoney.com，低封禁风险）===
+            detail = parser._try_wap_caifuhao(
+                post_id=post_id, source_id=source_id, post_url=url,
+                session=ws, proxies=self._request_proxies()
+            )
 
-                if detail['post_content']:
+            # === 兜底：curl_cffi Chrome 120 请求 PC 页面 ===
+            if not detail.get('ok') and detail.get('reason') not in PERMANENT_FAIL_REASONS:
+                fallback = parser._try_requests_caifuhao(
+                    url, session=ws, proxies=self._request_proxies()
+                )
+                if fallback.get('ok'):
+                    detail = fallback
+
+            return post_id, detail, url
+
+        print(f'{self.symbol}: [CAIFUHAO] WAP API主路径+curl_cffi兜底: total={total}, '
+              f'workers={WORKERS}, window={WINDOW_SIZE}')
+
+        window_done = 0
+        global_blocked = False
+
+        for wstart in range(0, total, WINDOW_SIZE):
+            if global_blocked:
+                print(f'{self.symbol}: [CAIFUHAO] 检测到封禁，冷却 {COOLDOWN_TIME[0]}-{COOLDOWN_TIME[1]}s + 刷新Cookie...')
+                cooldown = random.uniform(*COOLDOWN_TIME)
+                time.sleep(cooldown)
+                self._caifuhao_cookie_bootstrapped = False
+                self._bootstrap_caifuhao_session_via_browser()
+                master_cookies.clear()
+                master_cookies.extend(list(self._caifuhao_session.cookies))
+                # 清除所有 worker 的 thread-local session，下次自动重建
+                global_blocked = False
+                consecutive_blocks = 0
+
+            window = posts[wstart:wstart + WINDOW_SIZE]
+            window_blocked = 0
+
+            with ThreadPoolExecutor(max_workers=WORKERS) as executor:
+                futures = {executor.submit(crawl_one, p): p['_id'] for p in window}
+                for future in as_completed(futures):
+                    post_id, detail, url = future.result()
                     with lock:
-                        consecutive_http_fail = 0
-                    update_data = {'post_content': detail['post_content']}
-                    if detail.get('post_title'):
-                        update_data['post_title'] = detail['post_title']
-                    if detail.get('post_date'):
-                        update_data['post_date'] = detail['post_date']
-                    if detail.get('post_time'):
-                        update_data['post_time'] = detail['post_time']
-                    if detail.get('post_author'):
-                        update_data['post_author'] = detail['post_author']
+                        window_done += 1
+                        reason = detail.get('reason', 'unknown')
 
-                    with lock:
-                        if update_callback:
+                        if detail.get('ok'):
+                            update_data = {'post_content': detail['post_content']}
+                            for k in ('post_title', 'post_date', 'post_time', 'post_author'):
+                                if detail.get(k):
+                                    update_data[k] = detail[k]
                             update_callback(post_id, update_data)
-                        success_count += 1
-                    return True
+                            success_ids.add(post_id)
+                            consecutive_blocks = 0
+                        elif reason in PERMANENT_FAIL_REASONS:
+                            update_callback(post_id, {
+                                'post_content': '', '_detail_failed': True,
+                                'reason': reason, 'post_url': url
+                            })
+                            permanent_fail_ids.add(post_id)
+                        elif reason in RETRYABLE_REASONS:
+                            blocked_ids.add(post_id)
+                            window_blocked += 1
+                            if reason in ('http_403', 'http_429', 'blocked_validation'):
+                                consecutive_blocks += 1
+                        else:
+                            # 未知原因也归入可重试
+                            blocked_ids.add(post_id)
+                            window_blocked += 1
+
+            # 进度汇报
+            elapsed = time.time() - start_time
+            speed = window_done / max(elapsed / 60, 0.01)
+            eta = (total - window_done) / max(speed, 0.01)
+            print(f'{self.symbol}: [CAIFUHAO] {window_done}/{total} '
+                  f'({window_done/total*100:.0f}%) | '
+                  f'ok={len(success_ids)} | fail(perm)={len(permanent_fail_ids)} | '
+                  f'retry={len(blocked_ids)} | '
+                  f'{speed:.0f}条/分 | ETA {eta:.0f}分')
+
+            if consecutive_blocks >= BLOCK_THRESHOLD or window_blocked > len(window) * 0.3:
+                global_blocked = True
+                print(f'{self.symbol}: [CAIFUHAO] 封禁率过高 ({window_blocked}/{len(window)}), 触发冷却')
+
+            if wstart + WINDOW_SIZE < total and not global_blocked:
+                time.sleep(random.uniform(*WINDOW_PAUSE))
+
+        # ===== Pass 2：单线程重试被阻断的帖子（WAP API + 长延迟）=====
+        if blocked_ids:
+            retry_posts = [p for p in posts if p['_id'] in blocked_ids]
+            print(f'\n{self.symbol}: [CAIFUHAO-PASS2] 重试 {len(retry_posts)} 条阻断帖子 '
+                  f'(单线程, delay=1-3s, 冷却后刷新Cookie)...')
+            time.sleep(random.uniform(30, 60))
+            self._caifuhao_cookie_bootstrapped = False
+            self._bootstrap_caifuhao_session_via_browser()
+            retry_session = self._caifuhao_session
+
+            retry_ok = 0
+            retry_fail = 0
+            for i, post in enumerate(retry_posts):
+                time.sleep(random.uniform(1.0, 3.0))
+                post_id = post['_id']
+                source_id = extract_source_id(post)
+                url = caifuhao_url(post)
+
+                # 主路径：WAP API
+                detail = parser._try_wap_caifuhao(
+                    post_id=post_id, source_id=source_id, post_url=url,
+                    session=retry_session, proxies=self._request_proxies()
+                )
+                if not detail.get('ok') and detail.get('reason') not in PERMANENT_FAIL_REASONS:
+                    detail = parser._try_requests_caifuhao(
+                        url, session=retry_session, proxies=self._request_proxies()
+                    )
+
+                if detail.get('ok'):
+                    update_data = {'post_content': detail['post_content']}
+                    for k in ('post_title', 'post_date', 'post_time', 'post_author'):
+                        if detail.get(k):
+                            update_data[k] = detail[k]
+                    update_callback(post_id, update_data)
+                    retry_ok += 1
                 else:
-                    with lock:
-                        consecutive_http_fail += 1
-                        if update_callback:
-                            update_callback(
-                                post_id,
-                                {
-                                    'post_content': '',
-                                    '_detail_failed': True,
-                                    'reason': 'caifuhao_empty_or_invalid',
-                                    'post_url': post_url,
-                                }
-                            )
-                        error_count += 1
-                    return False
+                    reason = detail.get('reason', 'unknown')
+                    update_callback(post_id, {
+                        'post_content': '', '_detail_failed': True,
+                        'reason': f'retry_failed:{reason}', 'post_url': url
+                    })
+                    retry_fail += 1
+                if (i + 1) % 20 == 0:
+                    print(f'{self.symbol}: [CAIFUHAO-PASS2] {i+1}/{len(retry_posts)} '
+                          f'| ok={retry_ok} | fail={retry_fail}')
 
-            except Exception as e:
-                with lock:
-                    consecutive_http_fail += 1
-                    if update_callback:
-                        update_callback(
-                            post_id,
-                            {
-                                'post_content': '',
-                                '_detail_failed': True,
-                                'reason': f'caifuhao_exception:{type(e).__name__}',
-                                'post_url': post_url,
-                            }
-                        )
-                    error_count += 1
-                return False
+            print(f'{self.symbol}: [CAIFUHAO-PASS2] 完成: ok={retry_ok}, fail={retry_fail}')
 
-        # Step 2: 窗口分批爬取
-        interrupted = False
-        for window_start in range(0, total, WINDOW_SIZE):
-            if interrupted:
-                break
-
-            window = posts[window_start:window_start + WINDOW_SIZE]
-            window_end = min(window_start + len(window), total)
-
-            with ThreadPoolExecutor(max_workers=current_workers) as executor:
-                window_futures = []
-                for post in window:
-                    with lock:
-                        if consecutive_http_fail >= MAX_CONSECUTIVE_HTTP_FAIL:
-                            break
-                    # 请求间延迟
-                    time.sleep(random.uniform(current_delay, current_delay * 2))
-                    window_futures.append(executor.submit(crawl_one, post, session))
-
-                # 等待窗口内所有任务完成
-                for future in as_completed(window_futures):
-                    future.result()
-                    with lock:
-                        if consecutive_http_fail >= MAX_CONSECUTIVE_HTTP_FAIL and not interrupted:
-                            print(f'{self.symbol}: 财富号请求连续失败 {consecutive_http_fail} 次，'
-                                  f'疑似 IP 已被全局拦截，停止继续爬取。'
-                                  f'建议等待一段时间后重试或更换网络环境。')
-                            interrupted = True
-                        processed = success_count + error_count
-                        if processed % 20 == 0 or processed == total:
-                            elapsed = time.time() - stage2_start
-                            speed = processed / max(elapsed / 60, 0.01)
-                            eta_min = (total - processed) / max(speed, 0.01)
-                            print(f'{self.symbol}: 财富号进度 {processed}/{total} ({processed/total*100:.0f}%) | '
-                                  f'成功 {success_count} | 失败 {error_count} | '
-                                  f'耗时 {elapsed:.0f}s | 速度 {speed:.1f}条/分 | 预计剩余 {eta_min:.0f}分')
-                    if interrupted:
-                        break
-
-            # 自适应降级：连续失败达到阈值时增加延迟、降低并发
-            with lock:
-                if consecutive_http_fail >= ADAPTIVE_FAIL_THRESHOLD and consecutive_http_fail < MAX_CONSECUTIVE_HTTP_FAIL:
-                    old_delay = current_delay
-                    current_delay = min(current_delay * 2, 10.0)
-                    current_workers = max(1, current_workers - 1)
-                    print(f'{self.symbol}: [降级] 连续失败 {consecutive_http_fail} 次，'
-                          f'延迟 {old_delay:.1f}s → {current_delay:.1f}s，并发 {current_workers + 1} → {current_workers}')
-                elif consecutive_http_fail == 0 and current_delay > REQUEST_DELAY_RANGE[0]:
-                    # 恢复：连续成功时逐步恢复参数
-                    current_delay = max(REQUEST_DELAY_RANGE[0], current_delay * 0.8)
-                    current_workers = min(max_workers, current_workers + 1)
-                    print(f'{self.symbol}: [恢复] 延迟 {current_delay:.1f}s，并发 {current_workers}')
-
-            # 窗口间冷却暂停（最后一批不需要）
-            if window_end < total and not interrupted:
-                pause = random.uniform(*WINDOW_PAUSE_RANGE)
-                print(f'{self.symbol}:   窗口 {window_end}/{total} 完成，冷却 {pause:.0f}s...')
-                time.sleep(pause)
-
-        print(f'{self.symbol}: 财富号爬取完成，成功 {success_count}，失败 {error_count}')
+        total_elapsed = time.time() - start_time
+        final_fail = len(permanent_fail_ids) + len([p for p in posts
+                          if p['_id'] in blocked_ids and p['_id'] not in success_ids])
+        status = 'OK' if len(blocked_ids) == 0 else f'WARN({len(blocked_ids)}未恢复)'
+        print(f'{self.symbol}: 财富号爬取完成 [{status}] '
+              f'成功 {len(success_ids)}，永久失效 {len(permanent_fail_ids)}，'
+              f'总耗时 {total_elapsed:.0f}s ({total_elapsed/60:.1f}分)')
 
     def _crawl_guba_posts(self, posts: list, update_callback):
         """单线程爬取股吧原生帖子（JS fetch API + 自适应延迟）

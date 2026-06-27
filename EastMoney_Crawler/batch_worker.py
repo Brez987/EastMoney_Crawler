@@ -298,6 +298,7 @@ def clean_per_stock_temp(stock: str, crawl_mode: str = "incremental") -> None:
         DEFAULT_TEMP_DIR / f"{stock}_detail_failed.jsonl",
         DEFAULT_TEMP_DIR / f"{stock}_content_delta.jsonl",
         DEFAULT_TEMP_DIR / f"{stock}_detail_checkpoint.json",
+        DEFAULT_TEMP_DIR / f"{stock}_stage2_checkpoint.json",
         PROJECT_DIR / "temp_export" / f"{stock}_enhanced.csv",
         PROJECT_DIR / "temp_export" / f"{stock}_full_20090101.csv",
         PROJECT_DIR / "temp_export" / f"{stock}_comments.csv",

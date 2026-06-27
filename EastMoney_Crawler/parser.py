@@ -4,6 +4,7 @@ import re
 import json
 import hashlib
 import requests
+import time
 from bs4 import BeautifulSoup
 
 from browser_utils import create_stealth_chrome
@@ -170,40 +171,299 @@ class PostParser(object):
 
         return result
 
-    def _try_requests_caifuhao(self, post_url: str, session=None) -> dict:
-        """方向6：用 requests 快速获取财富号帖子正文（快5-10倍）
+    @staticmethod
+    def _looks_like_blocked_html(text: str, url: str = '') -> bool:
+        if 'validate' in (url or '').lower() or 'fd_guba_validate' in (url or ''):
+            return True
+        if not text:
+            return True
+        return any(
+            marker in text
+            for marker in (
+                'fd_guba_validate',
+                '身份核实',
+                '请完成安全验证',
+                '请输入验证码',
+                '<title>验证</title>',
+                'HTTP ERROR 403',
+                '请求遭到拒绝',
+                '未获授权',
+            )
+        )
 
-        直接 HTTP GET 财富号文章页面，用 BeautifulSoup 解析正文。
-        失败时返回空 dict，调用方会回退到 Selenium。
+    @staticmethod
+    def _looks_like_invalid_caifuhao(text: str) -> bool:
+        if not text:
+            return False
+        return any(
+            marker in text
+            for marker in (
+                '文章不存在',
+                '内容不存在',
+                '该文章已删除',
+                '该内容已删除',
+                '页面不存在',
+                '404',
+            )
+        )
 
-        Args:
-            post_url: 财富号文章 URL
-            session: 可选的 requests.Session，复用浏览器 cookies
+    @staticmethod
+    def _parse_json_or_jsonp(text: str) -> dict:
+        text = (text or '').strip()
+        if not text:
+            return {}
+        match = re.match(r'^[\w$]+\((.*)\)\s*;?\s*$', text, flags=re.S)
+        if match:
+            text = match.group(1)
+        return json.loads(text)
+
+    def _clean_caifuhao_api_content(self, raw_content: str) -> str:
+        if not raw_content:
+            return ''
+        soup = BeautifulSoup(raw_content, 'html.parser')
+        for node in soup(['script', 'style']):
+            node.decompose()
+        text = soup.get_text('\n', strip=True)
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        return self.clean_caifuhao_content('\n'.join(lines))
+
+    def _try_wap_caifuhao(
+        self,
+        post_id: str = '',
+        source_id: str = '',
+        post_url: str = '',
+        session=None,
+        proxies=None,
+        timeout=(5, 15),
+    ) -> dict:
+        """Fetch caifuhao article content from the WAP gbapi endpoint.
+
+        The PC article domain can return 403 while the WAP page loads content
+        through gbapi. For full-mode CSV rows, post_id is the guba mirror id and
+        source_id is the caifuhao news id from /news/{source_id}.
         """
         result = {
+            'ok': False,
             'post_content': '',
             'post_title': '',
             'post_date': '',
             'post_time': '',
-            'post_author': ''
+            'post_author': '',
+            'http_status': 0,
+            'reason': 'not_started',
+        }
+
+        source_id = str(source_id or '').strip()
+        post_id = str(post_id or '').strip()
+        if not source_id and post_url:
+            match = re.search(r'/news/(\d+)', post_url)
+            if match:
+                source_id = match.group(1)
+        if not source_id:
+            result['reason'] = 'missing_source_id'
+            return result
+
+        fetcher = session if session is not None else requests
+        headers = {
+            'User-Agent': (
+                'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) '
+                'AppleWebKit/605.1.15 (KHTML, like Gecko) '
+                'Version/17.0 Mobile/15E148 Safari/604.1'
+            ),
+            'Accept': 'application/json,text/javascript,*/*;q=0.01',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Origin': 'https://wap.eastmoney.com',
+            'Referer': f'https://wap.eastmoney.com/a/{source_id}.html',
+        }
+        base_params = {
+            'deviceid': '0d2798cab1716439a343c9965c20c59d',
+            'version': '2',
+            'product': 'eastmoney',
+            'plat': 'wap',
+        }
+
+        try:
+            if not post_id or not post_id.isdigit() or post_id == source_id:
+                brief_params = dict(
+                    base_params,
+                    postid=source_id,
+                    type='1',
+                    callback='callback',
+                    _=str(int(time.time() * 1000)),
+                )
+                brief_resp = fetcher.get(
+                    'https://gbapi.eastmoney.com/abstract/api/PostShort/ArticleBriefInfo',
+                    params=brief_params,
+                    headers=headers,
+                    timeout=timeout,
+                    proxies=proxies,
+                )
+                result['http_status'] = getattr(brief_resp, 'status_code', 0) or 0
+                if brief_resp.status_code in (403, 429):
+                    result['reason'] = f'http_{brief_resp.status_code}'
+                    return result
+                if brief_resp.status_code in (404, 410):
+                    result['reason'] = f'http_{brief_resp.status_code}'
+                    return result
+                if brief_resp.status_code != 200:
+                    result['reason'] = f'http_{brief_resp.status_code}'
+                    return result
+
+                brief_data = self._parse_json_or_jsonp(brief_resp.text)
+                brief_item = ((brief_data.get('re') or [{}])[0] or {})
+                mapped_post_id = str(brief_item.get('post_id') or '').strip()
+                if mapped_post_id and mapped_post_id.isdigit() and mapped_post_id != '0':
+                    post_id = mapped_post_id
+                else:
+                    result['reason'] = 'missing_post_id'
+                    return result
+
+            content_params = dict(
+                base_params,
+                postid=post_id,
+                newsid=source_id,
+                pi='',
+                ctoken='',
+                utoken='',
+                IsClick='false',
+                _=str(int(time.time() * 1000)),
+            )
+            resp = fetcher.get(
+                'https://gbapi.eastmoney.com/content/api/Post/ArticleContent',
+                params=content_params,
+                headers=headers,
+                timeout=timeout,
+                proxies=proxies,
+            )
+            result['http_status'] = getattr(resp, 'status_code', 0) or 0
+            if resp.status_code in (403, 429):
+                result['reason'] = f'http_{resp.status_code}'
+                return result
+            if resp.status_code in (404, 410):
+                result['reason'] = f'http_{resp.status_code}'
+                return result
+            if resp.status_code != 200:
+                result['reason'] = f'http_{resp.status_code}'
+                return result
+
+            data = self._parse_json_or_jsonp(resp.text)
+            post = data.get('post') or {}
+            if not data.get('rc') or not post:
+                message = str(data.get('me') or data.get('message') or '')
+                if any(marker in message for marker in ('不存在', '已删除', '删除', '参数错误')):
+                    result['reason'] = 'invalid_article'
+                elif '系统繁忙' in message:
+                    result['reason'] = 'wap_system_busy'
+                else:
+                    result['reason'] = 'wap_api_empty'
+                return result
+
+            raw_content = post.get('post_content') or post.get('post_abstract') or ''
+            result['post_content'] = self._clean_caifuhao_api_content(raw_content)
+            result['post_title'] = str(post.get('post_title') or '').strip()
+
+            publish_time = str(
+                post.get('post_publish_time')
+                or post.get('post_display_time')
+                or post.get('post_last_time')
+                or ''
+            )
+            date_str = self.remove_char(publish_time)
+            if len(date_str) >= 16:
+                result['post_date'] = date_str[:10]
+                result['post_time'] = date_str[11:16]
+
+            user = post.get('post_user') or {}
+            result['post_author'] = str(
+                user.get('user_nickname')
+                or user.get('user_name')
+                or ''
+            ).strip()
+
+            if result['post_content']:
+                result['ok'] = True
+                result['reason'] = 'ok'
+            else:
+                result['reason'] = 'body_not_found'
+
+        except Exception as e:
+            err_type = type(e).__name__
+            if 'Timeout' in err_type:
+                result['reason'] = 'timeout'
+            else:
+                result['reason'] = f'exception:{err_type}'
+
+        return result
+
+    def _try_requests_caifuhao(
+        self,
+        post_url: str,
+        session=None,
+        proxies=None,
+        timeout=(5, 15),
+    ) -> dict:
+        """用 HTTP 快速获取财富号正文，并返回可判定的结构化结果。"""
+        result = {
+            'ok': False,
+            'post_content': '',
+            'post_title': '',
+            'post_date': '',
+            'post_time': '',
+            'post_author': '',
+            'http_status': 0,
+            'reason': 'not_started',
         }
         try:
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                               'AppleWebKit/537.36 (KHTML, like Gecko) '
-                              'Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml',
+                              'Chrome/131.0.0.0 Safari/537.36',
+                'Accept': (
+                    'text/html,application/xhtml+xml,application/xml;q=0.9,'
+                    'image/avif,image/webp,image/apng,*/*;q=0.8'
+                ),
                 'Accept-Language': 'zh-CN,zh;q=0.9',
+                'Referer': 'https://guba.eastmoney.com/',
+                'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'same-site',
+                'Sec-Fetch-User': '?1',
             }
-            fetcher = session if session else requests
-            resp = fetcher.get(post_url, headers=headers, timeout=(3, 5))
+            fetcher = session if session is not None else requests
+            resp = fetcher.get(post_url, headers=headers, timeout=timeout, proxies=proxies)
+            result['http_status'] = getattr(resp, 'status_code', 0) or 0
+
+            if resp.status_code in (403, 429):
+                result['reason'] = f'http_{resp.status_code}'
+                return result
+            if resp.status_code in (404, 410):
+                result['reason'] = f'http_{resp.status_code}'
+                return result
             if resp.status_code != 200:
+                result['reason'] = f'http_{resp.status_code}'
                 return result
 
-            soup = BeautifulSoup(resp.text, 'html.parser')
+            final_url = str(getattr(resp, 'url', '') or '')
+            if 'roadshow.eastmoney.com' in final_url:
+                result['reason'] = 'invalid_article'
+                return result
 
-            # 提取正文（article-body 容器下的所有段落）
-            body = soup.select_one('div.article-body')
+            text = resp.text or ''
+            if self._looks_like_blocked_html(text[:8000], final_url):
+                result['reason'] = 'blocked_validation'
+                return result
+            if self._looks_like_invalid_caifuhao(text[:8000]):
+                result['reason'] = 'invalid_article'
+                return result
+
+            soup = BeautifulSoup(text, 'html.parser')
+
+            # 提取正文：财富号历史页面有多套模板，按常见容器逐级兼容。
+            body = soup.select_one(
+                'div.article-body, div.articleContent, div#ContentBody, '
+                'div.newsContent, div.newstext, article'
+            )
             if body:
                 paragraphs = body.find_all(['p', 'div', 'section'])
                 content_parts = []
@@ -214,28 +474,38 @@ class PostParser(object):
                 result['post_content'] = '\n'.join(content_parts)
 
             # 提取标题
-            title_el = soup.select_one('h1.article-title, div.article-title, h1')
+            title_el = soup.select_one('h1.article-title, div.article-title, h1.title, h1')
             if title_el:
                 result['post_title'] = title_el.get_text(strip=True)
 
             # 提取时间/作者
-            meta = soup.select_one('div.article-meta, div.article-head')
+            meta = soup.select_one('div.article-meta, div.article-head, div.newsauthor, div.author-info')
             if meta:
                 meta_text = meta.get_text(strip=True)
                 date_match = re.search(r'(\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2})', meta_text)
                 if date_match:
                     result['post_date'] = date_match.group(1)[:10]
                     result['post_time'] = date_match.group(1)[11:]
+                author_el = meta.select_one('a.author_name, a[href*="caifuhao"], a')
+                if author_el:
+                    result['post_author'] = author_el.get_text(strip=True)
 
             # 清洗内容
             if result['post_content']:
                 result['post_content'] = self.clean_caifuhao_content(result['post_content'])
+                result['ok'] = True
+                result['reason'] = 'ok'
+            else:
+                result['reason'] = 'body_not_found'
 
-        except Exception:
-            pass
+        except Exception as e:
+            err_type = type(e).__name__
+            if 'Timeout' in err_type:
+                result['reason'] = 'timeout'
+            else:
+                result['reason'] = f'exception:{err_type}'
 
         return result
-
     def parse_post_detail(self, post_url: str, retry: bool = True) -> dict:
         """访问帖子详情页，提取完整正文内容
         

@@ -1,0 +1,21 @@
+# 临时数据目录
+temp_extract/
+temp_export/
+.pipeline_flags/
+data/
+
+# 备份
+original project/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 环境
+.env
+*.log
+
+# 大文件
+*.rar
+*.zip

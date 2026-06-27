@@ -969,6 +969,8 @@ def load_posts_for_detail_crawl(csv_paths: list, skip_failed_ids: set = None):
                     posts.append({
                         '_id': pid,
                         'post_url': url,
+                        'post_source_id': row.get('post_source_id', ''),
+                        'post_type': row.get('post_type', ''),
                         'post_content': '',
                     })
                     caifuhao_empty += 1
@@ -1138,9 +1140,9 @@ def crawl_post_detail_csv(stock_code: str, csv_paths: list, detail_workers: int 
     """从 CSV 读取并补爬帖子正文（支持断点续爬 + 线程安全回调）
 
     策略：
-    — 普通股吧帖：content 为空时直接用 post_title 填充（本地完成，不爬详情页）
-    — 财富号帖子：content 为空时进入爬取队列（多线程 requests）
-    — 不爬评论，不要求 MongoDB
+    - 普通股吧帖：content 为空时直接用 post_title 填充（本地完成，不爬详情页）
+    - 财富号帖子：content 为空时进入爬取队列（多线程 requests）
+    - 不爬评论，不要求 MongoDB
 
     Args:
         stock_code: 股票代码
@@ -1182,6 +1184,14 @@ def crawl_post_detail_csv(stock_code: str, csv_paths: list, detail_workers: int 
         skipped = original_count - len(posts)
         print(f'  [断点续爬] 检查点中发现 {len(done_ids)} 条已完成，跳过 {skipped} 条，剩余 {len(posts)} 条待爬')
 
+    # 试跑限制：通过环境变量 STAGE2_DETAIL_LIMIT 控制爬取数量，用于验证成功率
+    detail_limit = os.environ.get('STAGE2_DETAIL_LIMIT', '')
+    if detail_limit and detail_limit.strip().isdigit():
+        limit = int(detail_limit.strip())
+        if limit > 0 and len(posts) > limit:
+            print(f'  [试跑模式] STAGE2_DETAIL_LIMIT={limit}，仅爬取前 {limit} 条')
+            posts = posts[:limit]
+
     if not posts:
         if content_updates:
             _flush_updates_to_csv(csv_paths, content_updates)
@@ -1194,7 +1204,6 @@ def crawl_post_detail_csv(stock_code: str, csv_paths: list, detail_workers: int 
     crawl_count = [0]
     batch_done = set()
     cb_lock = threading.Lock()
-    stage2_start = time.time()
 
     def update_callback(post_id, update_data):
         pid = str(post_id)
@@ -1215,12 +1224,6 @@ def crawl_post_detail_csv(stock_code: str, csv_paths: list, detail_workers: int 
             if crawl_count[0] % CHECKPOINT_INTERVAL == 0:
                 _save_checkpoint(stock_code, batch_done)
                 batch_done.clear()
-                # Real-time progress for Stage 2
-                elapsed = time.time() - stage2_start
-                speed = crawl_count[0] / max(elapsed / 60, 0.01)
-                eta_min = (len(posts) - crawl_count[0]) / max(speed, 0.01)
-                print(f'  [Stage 2] 进度 {crawl_count[0]}/{len(posts)} ({crawl_count[0]/len(posts)*100:.0f}%) | '
-                      f'耗时 {elapsed:.0f}s | 速度 {speed:.1f}条/分 | 预计剩余 {eta_min:.0f}分')
 
     post_crawler = PostCrawler(stock_code)
     post_crawler.crawl_post_detail(
@@ -1238,7 +1241,6 @@ def crawl_post_detail_csv(stock_code: str, csv_paths: list, detail_workers: int 
 
     print(f'  ✓ 财富号正文爬取完成，共成功爬取 {crawl_count[0]}/{len(posts)} 条')
     return True
-
 
 def _flush_updates_to_csv(csv_paths: list, updates: dict):
     """增量写回 CSV（断点续爬支持）"""
@@ -1277,7 +1279,12 @@ def run_stage2(detail_workers: int = 3):
         print(f'  检测到新帖子 CSV: {new_csv}')
 
     # 补爬正文（财富号走多线程 requests，股吧原生走多 worker 并发）
-    crawl_post_detail_csv(STOCK_CODE, csv_paths, detail_workers=detail_workers)
+    ok = crawl_post_detail_csv(STOCK_CODE, csv_paths, detail_workers=detail_workers)
+    if not ok:
+        print(f'\n{"="*60}')
+        print('[Stage 2] 暂停/未完成，未写入 stage2.done')
+        print(f'{"="*60}')
+        return False
 
     set_flag('stage2')
     print(f'\n{"="*60}')
@@ -1315,7 +1322,12 @@ def run_stage2_full(detail_workers: int = 3):
     if actual_rows != manifest.get('rows', 0):
         print(f'[警告] full_posts 行数与 manifest 不符: manifest={manifest.get("rows")}, actual={actual_rows}')
 
-    crawl_post_detail_csv(STOCK_CODE, [full_csv], detail_workers=detail_workers)
+    ok = crawl_post_detail_csv(STOCK_CODE, [full_csv], detail_workers=detail_workers)
+    if not ok:
+        print(f'\n{"="*60}')
+        print('[Stage 2 full] 暂停/未完成，未写入 stage2.done')
+        print(f'{"="*60}')
+        return False
 
     set_flag('stage2')
     print(f'\n{"="*60}')

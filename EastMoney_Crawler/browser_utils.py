@@ -71,26 +71,42 @@ def configure_local_webdriver_proxy_bypass():
         os.environ[env_name] = ",".join(existing_parts)
 
 
-def create_stealth_chrome(stealth_script_path: Optional[str] = None) -> webdriver.Chrome:
+def create_stealth_chrome(
+    stealth_script_path: Optional[str] = None,
+    user_data_dir: Optional[str] = None,
+    incognito: bool = True,
+    headless: Optional[bool] = None,
+) -> webdriver.Chrome:
     configure_runtime_library_path()
     configure_local_webdriver_proxy_bypass()
 
     options = webdriver.ChromeOptions()
     options.add_argument("lang=zh_CN.UTF-8")
     options.add_argument(
-        'user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-        '(KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36"'
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     )
-    options.add_argument("--headless=new")
+    if headless is None:
+        headless = os.environ.get("EASTMONEY_CHROME_HEADLESS", "1") != "0"
+    if headless:
+        options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-    # 使用独立用户数据目录，避免浏览器实例间共享状态
-    import tempfile
-    user_data_dir = tempfile.mkdtemp(prefix="chrome_")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+
+    # 默认使用独立用户数据目录；财富号兜底可显式传固定 profile 复用 Cookie。
+    if user_data_dir is None:
+        import tempfile
+        user_data_dir = tempfile.mkdtemp(prefix="chrome_")
+    else:
+        os.makedirs(user_data_dir, exist_ok=True)
     options.add_argument(f"--user-data-dir={user_data_dir}")
-    options.add_argument("--incognito")
+    if incognito:
+        options.add_argument("--incognito")
 
     chrome_binary = resolve_chrome_binary()
     if chrome_binary:
@@ -103,6 +119,11 @@ def create_stealth_chrome(stealth_script_path: Optional[str] = None) -> webdrive
     # 方向4：设置页面加载超时（5秒），避免慢加载页面阻塞
     browser.set_page_load_timeout(5)
     browser.set_script_timeout(3)
+
+    if stealth_script_path is None:
+        default_stealth = _SCRIPT_DIR / "stealth.min.js"
+        if default_stealth.exists():
+            stealth_script_path = str(default_stealth)
 
     if stealth_script_path and os.path.exists(stealth_script_path):
         with open(stealth_script_path, encoding="utf-8") as handle:

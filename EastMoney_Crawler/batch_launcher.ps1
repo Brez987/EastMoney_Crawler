@@ -98,7 +98,6 @@ for ($i = 1; $i -le $WorkerCount; $i++) {
     if ($RetryFailed) {
         $workerArgs += "--retry-failed"
     }
-
     $startArgs = @{
         FilePath = $Python
         ArgumentList = $workerArgs
