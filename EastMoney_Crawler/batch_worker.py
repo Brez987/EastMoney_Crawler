@@ -268,17 +268,6 @@ def disk_free_gb(path: Path) -> float:
     return usage.free / (1024 ** 3)
 
 
-def output_csv_size_mb(stock: str) -> float:
-    candidates = [
-        DEFAULT_DATA_DIR / f"{stock}_enhanced.csv",
-        PROJECT_DIR / "temp_export" / f"{stock}_enhanced.csv",
-    ]
-    for path in candidates:
-        if path.exists():
-            return round(path.stat().st_size / 1024 / 1024, 2)
-    return 0.0
-
-
 def detail_failed_count(stock: str) -> int:
     path = DEFAULT_TEMP_DIR / f"{stock}_detail_failed.jsonl"
     if not path.exists():
@@ -327,7 +316,106 @@ def clean_per_stock_temp(stock: str, crawl_mode: str = "incremental") -> None:
         print(f"[{stock}] cleaned stale temp files: {', '.join(removed)}")
 
 
-def stream_subprocess(cmd: list[str], stage: int, stock: str) -> StageResult:
+# ── 实时进度解析 ──
+# Stage 1 full: "000001: [OK] 进度 50/500 页 (10%) | 成功 50 页 | 累计 4000 条 | 耗时 120s | 速度 25.0页/分 | 预计剩余 18分"
+_RE_FULL_S1 = re.compile(
+    r"(\d{6}):\s+\[(?:OK|WARN:\d+)\]\s+进度\s+(\d+)/(\d+)\s+页\s+\((\d+)%\)"
+    r"\s*\|\s*成功\s+(\d+)\s+页\s*\|\s*累计\s+(\d+)\s+条"
+    r"\s*\|\s*耗时\s+(\d+)s\s*\|\s*速度\s+(\d+\.?\d*)页/分\s*\|\s*预计剩余\s+(\d+\.?\d*)分"
+)
+# Stage 2 caifuhao: "000001: [CAIFUHAO] 50/100 (50%) | ok=50 | fail(perm)=0 | retry=0 | 419条/分 | ETA 0分"
+_RE_CAIFUHAO = re.compile(
+    r"(\d{6}):\s+\[CAIFUHAO\]\s+(\d+)/(\d+)\s+\((\d+)%\)"
+    r"\s*\|\s*ok=(\d+)\s*\|\s*fail\(perm\)=(\d+)"
+    r"\s*\|\s*retry=(\d+)\s*\|\s*(\d+\.?\d*)条/分\s*\|\s*ETA\s+(\d+\.?\d*)分"
+)
+# Stage 1 incremental: "000001: 已经成功爬取第 5 页帖子基本信息"
+_RE_INC_S1 = re.compile(
+    r"(\d{6}):\s+已经成功爬取第\s+(\d+)\s+页帖子基本信息"
+)
+# Stage done markers
+_RE_S1_DONE = re.compile(r"(\d{6}):\s+(?:全量列表爬取完成|成功爬取.*共\s+\d+\s+页帖子)")
+_RE_S2_DONE = re.compile(r"(\d{6}):\s+(?:财富号爬取完成|正文爬取完成|guba.*爬取完成)")
+_RE_S3_DONE = re.compile(r"\[Stage\s+3(?:\s+full)?\]\s+全部完成！")
+_RE_STAGE_DONE = re.compile(r"\[Stage\s+(\d)(?:\s+full)?\]\s+完成！")
+
+# ── 进度文件写入 ──
+PROGRESS_SUFFIX = ".progress.json"
+
+
+def write_live_progress(progress_dir: Path, stock: str, payload: dict) -> None:
+    """写入实时进度文件（原子性写入，防读取撕裂）"""
+    if progress_dir is None:
+        return
+    payload.setdefault("stock", stock)
+    payload.setdefault("updated_at", now_iso())
+    path = progress_dir / f"{stock}{PROGRESS_SUFFIX}"
+    progress_dir.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def parse_progress_line(line: str, stage: int, stock: str) -> dict | None:
+    """从 auto_pipeline 的一行输出中提取进度信息。"""
+    if stage == 1:
+        m = _RE_FULL_S1.search(line)
+        if m:
+            return {
+                "stage": 1, "stage_label": "Stage 1",
+                "status": "running",
+                "progress": f"{m.group(2)}/{m.group(3)}",
+                "pct": int(m.group(4)),
+                "ok_pages": int(m.group(5)),
+                "total_rows": int(m.group(6)),
+                "elapsed": f"{m.group(7)}s",
+                "speed": f"{m.group(8)}页/分",
+                "eta": f"{m.group(9)}分",
+            }
+        m = _RE_INC_S1.search(line)
+        if m:
+            return {
+                "stage": 1, "stage_label": "Stage 1",
+                "status": "running",
+                "progress": f"第{m.group(2)}页",
+                "pct": 0,
+            }
+        if _RE_S1_DONE.search(line):
+            return {"stage": 1, "stage_label": "Stage 1", "status": "done"}
+
+    if stage == 2:
+        m = _RE_CAIFUHAO.search(line)
+        if m:
+            return {
+                "stage": 2, "stage_label": "Stage 2",
+                "status": "running",
+                "progress": f"{m.group(2)}/{m.group(3)}",
+                "pct": int(m.group(4)),
+                "ok": int(m.group(5)),
+                "fail_perm": int(m.group(6)),
+                "retry": int(m.group(7)),
+                "speed": f"{m.group(8)}条/分",
+                "eta": f"{m.group(9)}分",
+            }
+        if _RE_S2_DONE.search(line):
+            return {"stage": 2, "stage_label": "Stage 2", "status": "done"}
+
+    if stage == 3:
+        if _RE_S3_DONE.search(line):
+            return {"stage": 3, "stage_label": "Stage 3", "status": "done"}
+
+    # 通用 Stage 完成检测
+    m = _RE_STAGE_DONE.search(line)
+    if m:
+        s = int(m.group(1))
+        return {"stage": s, "stage_label": f"Stage {s}", "status": "done"}
+
+    return None
+
+
+def stream_subprocess(cmd: list[str], stage: int, stock: str, progress_dir: Path | None = None) -> StageResult:
     started = time.time()
     print(f"[{stock}][stage {stage}] running: {' '.join(cmd)}")
     process = subprocess.Popen(
@@ -346,6 +434,11 @@ def stream_subprocess(cmd: list[str], stage: int, stock: str) -> StageResult:
         tail.append(line)
         if len(tail) > 200:
             tail = tail[-200:]
+        # 实时进度解析
+        if progress_dir is not None:
+            progress = parse_progress_line(line, stage, stock)
+            if progress is not None:
+                write_live_progress(progress_dir, stock, progress)
     returncode = process.wait()
     seconds = time.time() - started
     print(f"[{stock}][stage {stage}] exit={returncode}, seconds={seconds:.1f}")
@@ -490,6 +583,7 @@ def run_stock_pipeline(
                 ),
                 stage=stage,
                 stock=stock,
+                progress_dir=args.progress_dir,
             )
             summary[f"stage{stage}_seconds"] = round(
                 summary[f"stage{stage}_seconds"] + result.seconds, 2
@@ -603,6 +697,12 @@ def process_claim(claim: ClaimedStock, args: argparse.Namespace, source_dirs: li
             claim.lock_path.unlink()
         except FileNotFoundError:
             pass
+        # 清理实时进度文件
+        for suff in (PROGRESS_SUFFIX, PROGRESS_SUFFIX + ".tmp"):
+            try:
+                (args.progress_dir / f"{claim.stock}{suff}").unlink()
+            except (FileNotFoundError, OSError):
+                pass
 
 
 def find_next_claim(

@@ -16,7 +16,8 @@ param(
     [string]$ListSource = "html",
     [switch]$DryRun,
     [switch]$RetryFailed,
-    [switch]$Visible
+    [switch]$Visible,
+    [switch]$Watch
 )
 
 $ErrorActionPreference = "Stop"
@@ -114,12 +115,37 @@ for ($i = 1; $i -le $WorkerCount; $i++) {
     Write-Host "Started $workerId pid=$($process.Id)"
 }
 
-Write-Host "Use these commands to monitor progress:"
-if ($CrawlMode -eq "full") {
-    Write-Host "  (Get-ChildItem batch_progress_full_20090101\*.done).Count"
-    Write-Host "  (Get-ChildItem batch_progress_full_20090101\*.failed).Count"
-} else {
-    Write-Host "  (Get-ChildItem batch_progress\*.done).Count"
-    Write-Host "  (Get-ChildItem batch_progress\*.failed).Count"
+# ── 启动实时进度面板 ──
+if ($Watch) {
+    $watchScript = Join-Path $ProjectDir "watch_batch_progress.ps1"
+    $watchArgs = @(
+        "-File", $watchScript,
+        "-ProgressDir", $ProgressDir,
+        "-RefreshSeconds", "10"
+    )
+    $watchProcess = Start-Process -FilePath "powershell.exe" -ArgumentList $watchArgs -PassThru -WindowStyle Normal
+    Write-Host "Started progress watcher pid=$($watchProcess.Id)"
 }
-Write-Host "  Get-ChildItem batch_logs\*.log"
+
+Write-Host ""
+Write-Host "=== Monitor ==="
+if ($Watch) {
+    Write-Host "  Progress panel is running in a separate window (Ctrl+C to exit)"
+} else {
+    Write-Host "  Start progress panel:"
+    if ($CrawlMode -eq "full") {
+        Write-Host "    .\watch_batch_progress.ps1"
+    } else {
+        Write-Host "    .\watch_batch_progress.ps1 -ProgressDir batch_progress"
+    }
+}
+Write-Host ""
+Write-Host "  Quick stats:"
+if ($CrawlMode -eq "full") {
+    Write-Host "    (Get-ChildItem batch_progress_full_20090101\*.done).Count"
+    Write-Host "    (Get-ChildItem batch_progress_full_20090101\*.failed).Count"
+} else {
+    Write-Host "    (Get-ChildItem batch_progress\*.done).Count"
+    Write-Host "    (Get-ChildItem batch_progress\*.failed).Count"
+}
+Write-Host "  View logs:  Get-ChildItem batch_logs\*.log"

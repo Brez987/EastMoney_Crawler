@@ -644,8 +644,12 @@ class PostCrawler(object):
         COOLDOWN_TIME = (30.0, 60.0)  # 封禁后冷却
 
         # 浏览器预热主 Cookie 池（仅一次，供所有 worker 复制）
-        self._bootstrap_caifuhao_session_via_browser()
-        master_cookies = list(self._caifuhao_session.cookies)
+        # 非致命：浏览器启动失败时 WAP API 路径仍可正常工作
+        try:
+            self._bootstrap_caifuhao_session_via_browser()
+        except Exception as e:
+            print(f'{self.symbol}: [CAIFUHAO] browser cookie warmup failed (WAP API path still works): {e}')
+        master_cookies = list(self._caifuhao_session.cookies) if self._caifuhao_session is not None else []
         parser = PostParser()
 
         def extract_source_id(post: dict) -> str:
@@ -732,9 +736,13 @@ class PostCrawler(object):
                 cooldown = random.uniform(*COOLDOWN_TIME)
                 time.sleep(cooldown)
                 self._caifuhao_cookie_bootstrapped = False
-                self._bootstrap_caifuhao_session_via_browser()
+                try:
+                    self._bootstrap_caifuhao_session_via_browser()
+                except Exception as e:
+                    print(f'{self.symbol}: [CAIFUHAO] cooldown cookie refresh failed (continuing with WAP API): {e}')
                 master_cookies.clear()
-                master_cookies.extend(list(self._caifuhao_session.cookies))
+                if self._caifuhao_session is not None:
+                    master_cookies.extend(list(self._caifuhao_session.cookies))
                 # 清除所有 worker 的 thread-local session，下次自动重建
                 global_blocked = False
                 consecutive_blocks = 0
