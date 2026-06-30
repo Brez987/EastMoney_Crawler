@@ -34,9 +34,26 @@ from mongodb import MongoAPI
 from crawler import PostCrawler, CommentCrawler
 
 if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+
+
+def _tmp_path(path: str, attempt: int = 1) -> str:
+    return f"{path}.tmp.{os.getpid()}.{threading.get_ident()}.{attempt}"
+
+
+def _safe_replace(src: str, dst: str, max_retries: int = 5) -> None:
+    for attempt in range(1, max_retries + 1):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as exc:
+            if attempt == max_retries:
+                raise
+            delay = 0.5 * attempt
+            print(f"[safe_replace] retry {attempt}/{max_retries} after {delay:.1f}s: {exc}")
+            time.sleep(delay)
 
 # ==================== 配置 ====================
 _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -68,7 +85,7 @@ COMMENT_END_DATE = datetime.now().strftime('%Y-%m-%d')
 CSV_FIELDNAMES = [
     'user_id', 'post_id', 'post_source_id', 'post_type',
     'user_name', 'post_publish_time', 'stockbar_name', 'stockbar_code',
-    'forward', 'coment_count', 'click_count',
+    'forward', 'coment_count', 'click_count', 'like_count',
     'post_title', 'url', 'content'
 ]
 
@@ -264,7 +281,7 @@ def extract_csv_from_rar(stock_code: str) -> str:
         subprocess.run(cmd, capture_output=True, text=True)
         inner_extracted = os.path.join(TEMP_DIR, rar_internal_path)
         if os.path.exists(inner_extracted):
-            shutil.move(inner_extracted, extracted_path)
+            _safe_replace(inner_extracted, extracted_path)
             inner_dir = os.path.join(TEMP_DIR, RAR_INTERNAL_DIR)
             if os.path.exists(inner_dir) and not os.listdir(inner_dir):
                 os.rmdir(inner_dir)
@@ -277,7 +294,7 @@ def extract_csv_from_rar(stock_code: str) -> str:
         return None
 
     # 重命名为 base.csv，避免与后续新帖子文件混淆
-    shutil.move(extracted_path, base_path)
+    _safe_replace(extracted_path, base_path)
     file_size = os.path.getsize(base_path) / 1024 / 1024
     print(f'  ✓ 提取成功: {base_path} ({file_size:.1f} MB)')
     return base_path
@@ -357,6 +374,7 @@ def make_csv_storage_callback(stock_code: str, existing_ids: set):
                 'forward': dic.get('forward', '0'),
                 'coment_count': dic.get('comment_num', 0),
                 'click_count': dic.get('post_view', 0),
+                'like_count': dic.get('like_num', 0),
                 'post_title': dic.get('post_title', ''),
                 'url': dic.get('post_url', ''),
                 'content': dic.get('post_content', ''),
@@ -409,6 +427,7 @@ def _full_csv_row_from_post_dict(stock_code: str, dic: dict) -> dict | None:
         'forward': dic.get('forward', '0'),
         'coment_count': dic.get('comment_num', 0),
         'click_count': dic.get('post_view', 0),
+        'like_count': dic.get('like_num', 0),
         'post_title': dic.get('post_title', ''),
         'url': dic.get('post_url', ''),
         'content': dic.get('post_content', ''),
@@ -436,11 +455,11 @@ def write_full_page_cache(stock_code: str, page_num: int, rows: list, meta: dict
         'created_at': datetime.now().isoformat(),
     }
     path = full_page_cache_path(stock_code, page_num)
-    tmp = path + '.tmp'
+    tmp = _tmp_path(path)
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(payload, f, ensure_ascii=False)
         f.write('\n')
-    os.replace(tmp, path)
+    _safe_replace(tmp, path)
 
 
 def read_full_page_cache(stock_code: str, page_num: int) -> dict | None:
@@ -539,6 +558,7 @@ def make_full_storage_callback(stock_code: str):
                 'forward': dic.get('forward', '0'),
                 'coment_count': dic.get('comment_num', 0),
                 'click_count': dic.get('post_view', 0),
+                'like_count': dic.get('like_num', 0),
                 'post_title': dic.get('post_title', ''),
                 'url': dic.get('post_url', ''),
                 'content': dic.get('post_content', ''),
@@ -585,11 +605,11 @@ def write_full_manifest(stock_code: str, start_date: str, summary: dict):
         "created_at": datetime.now().isoformat(),
     }
     path = full_manifest_path(stock_code)
-    tmp = path + ".tmp"
+    tmp = _tmp_path(path)
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
         f.write("\n")
-    os.replace(tmp, path)
+    _safe_replace(tmp, path)
 
 
 def read_full_manifest(stock_code: str) -> dict | None:
@@ -623,11 +643,11 @@ def write_stage1_manifest(
         "created_at": datetime.now().isoformat(),
     }
     path = stage1_manifest_path(stock_code)
-    tmp = path + ".tmp"
+    tmp = _tmp_path(path)
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
         f.write("\n")
-    os.replace(tmp, path)
+    _safe_replace(tmp, path)
 
 
 def read_stage1_manifest(stock_code: str) -> dict | None:
@@ -992,7 +1012,7 @@ def update_csv_content(csv_path: str, updates: dict):
     if not updates:
         return
 
-    tmp_path = csv_path + '.tmp'
+    tmp_path = _tmp_path(csv_path)
     updated = 0
 
     with open(csv_path, 'r', encoding='utf-8') as f_in, \
@@ -1008,7 +1028,7 @@ def update_csv_content(csv_path: str, updates: dict):
                 updated += 1
             writer.writerow(row)
 
-    shutil.move(tmp_path, csv_path)
+    _safe_replace(tmp_path, csv_path)
     print(f'  ✓ 已更新 CSV: {updated} 条记录的正文字段')
 
 
@@ -1077,6 +1097,10 @@ def _load_detail_failed_ids(stock_code: str) -> set:
     """读取已确认正文失效/为空的财富号 post_id，避免下次 Stage 2 重复爬。"""
     path = _detail_failed_path(stock_code)
     failed_ids = set()
+    retryable_reasons = {
+        'http_403', 'http_429', 'blocked_validation', 'timeout',
+        'body_not_found', 'wap_system_busy', 'wap_api_empty',
+    }
     if not os.path.exists(path):
         return failed_ids
     with open(path, 'r', encoding='utf-8') as f:
@@ -1089,7 +1113,10 @@ def _load_detail_failed_ids(stock_code: str) -> set:
             except json.JSONDecodeError:
                 continue
             pid = str(row.get('post_id', ''))
-            if pid:
+            reason = str(row.get('reason', '') or '')
+            if reason.startswith('retry_failed:'):
+                reason = reason.split(':', 1)[1]
+            if pid and reason not in retryable_reasons:
                 failed_ids.add(pid)
     return failed_ids
 
@@ -1226,7 +1253,7 @@ def crawl_post_detail_csv(stock_code: str, csv_paths: list, detail_workers: int 
                 batch_done.clear()
 
     post_crawler = PostCrawler(stock_code)
-    post_crawler.crawl_post_detail(
+    ok = post_crawler.crawl_post_detail(
         posts=posts,
         update_callback=update_callback,
         max_workers=detail_workers
@@ -1236,6 +1263,9 @@ def crawl_post_detail_csv(stock_code: str, csv_paths: list, detail_workers: int 
     _flush_updates_to_csv(csv_paths, content_updates)
     if batch_done:
         _save_checkpoint(stock_code, batch_done)
+    if ok is False:
+        print('  [pause] caifuhao detail crawl hit retryable blocking; checkpoint kept for next retry')
+        return False
     _delete_checkpoint(stock_code)
     _delete_content_delta(stock_code)
 

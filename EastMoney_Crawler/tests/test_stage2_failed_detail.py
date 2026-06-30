@@ -2,6 +2,7 @@ import csv
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -59,6 +60,91 @@ class Stage2FailedDetailTests(unittest.TestCase):
         self.assertIn("Second line", result["post_content"])
         self.assertEqual(len(session.calls), 1)
         self.assertIn("ArticleContent", session.calls[0][0])
+
+    def test_wap_caifuhao_api_tolerates_response_text_decode_error(self):
+        payload = {
+            "rc": 1,
+            "post": {
+                "post_title": "API title",
+                "post_content": "<p>Hello&nbsp;world</p>",
+                "post_publish_time": "2025-07-19 09:54:55",
+                "post_user": {"user_nickname": "api author"},
+            },
+        }
+
+        class FakeResponse:
+            status_code = 200
+            content = json.dumps(payload).encode("utf-8")
+
+            @property
+            def text(self):
+                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad byte")
+
+        class FakeSession:
+            def get(self, url, params=None, headers=None, timeout=None, proxies=None):
+                return FakeResponse()
+
+        result = PostParser()._try_wap_caifuhao(
+            post_id="1573140480",
+            source_id="20250719095455869493170",
+            session=FakeSession(),
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["reason"], "ok")
+        self.assertIn("Hello", result["post_content"])
+
+    def test_requests_caifuhao_tolerates_response_text_decode_error(self):
+        html = (
+            "<html><body>"
+            "<h1 class='article-title'>Title</h1>"
+            "<div class='article-meta'>2025-07-19 09:54 <a>author</a></div>"
+            "<div class='article-body'><p>Long enough article body</p></div>"
+            "</body></html>"
+        )
+
+        class FakeResponse:
+            status_code = 200
+            url = "https://caifuhao.eastmoney.com/news/1"
+            content = html.encode("utf-8")
+
+            @property
+            def text(self):
+                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad byte")
+
+        class FakeSession:
+            def get(self, url, headers=None, timeout=None, proxies=None):
+                return FakeResponse()
+
+        result = PostParser()._try_requests_caifuhao(
+            "https://caifuhao.eastmoney.com/news/1",
+            session=FakeSession(),
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["reason"], "ok")
+        self.assertIn("Long enough", result["post_content"])
+
+    def test_safe_replace_retries_permission_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "src.txt"
+            dst = Path(tmpdir) / "dst.txt"
+            src.write_text("new", encoding="utf-8")
+            real_replace = os.replace
+            calls = []
+
+            def flaky_replace(source, target):
+                if not calls:
+                    calls.append("failed")
+                    raise PermissionError("locked")
+                return real_replace(source, target)
+
+            with mock.patch.object(pipeline.os, "replace", side_effect=flaky_replace), \
+                 mock.patch.object(pipeline.time, "sleep") as sleep:
+                pipeline._safe_replace(str(src), str(dst))
+
+            self.assertEqual(dst.read_text(encoding="utf-8"), "new")
+            sleep.assert_called_once()
 
     def test_caifuhao_crawl_prefers_wap_api_without_pc_fallback(self):
         callbacks = []

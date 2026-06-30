@@ -23,6 +23,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+
 
 PROJECT_DIR = Path(__file__).resolve().parent
 AUTO_PIPELINE = PROJECT_DIR / "auto_pipeline_000001.py"
@@ -34,6 +39,9 @@ DEFAULT_TEMP_DIR = PROJECT_DIR / "temp_extract"
 STOCK_CSV_RE = re.compile(r"^\d{6}\.csv$")
 REQUIRED_CSV_COLUMNS = {"post_id", "post_publish_time", "post_title", "url", "content"}
 TERMINAL_SUFFIXES = (".done", ".failed", ".failed_upload")
+DEFERRED_SUFFIX = ".deferred"
+OWNED_STATE_SUFFIXES = TERMINAL_SUFFIXES + (".retrying", DEFERRED_SUFFIX)
+SPACE_ESTIMATE_CACHE: dict[tuple[str, str], tuple[float, float]] = {}
 
 
 @dataclass
@@ -187,20 +195,123 @@ def is_stale(lock_path: Path, stale_seconds: float) -> bool:
     return age > stale_seconds
 
 
-def write_json(path: Path, payload: dict) -> None:
+def read_json_file(path: Path) -> dict | None:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def read_lock_worker_id(lock_path: Path) -> str | None:
+    data = read_json_file(lock_path)
+    if data is None:
+        return None
+    if not data:
+        return ""
+    return str(data.get("worker_id") or "")
+
+
+def deferred_retry_after_epoch(progress_dir: Path, stock: str, now: float | None = None) -> float | None:
+    path = state_path(progress_dir, stock, DEFERRED_SUFFIX)
+    data = read_json_file(path)
+    if data is None:
+        return None
+    retry_after = float(data.get("retry_after_epoch") or 0)
+    if retry_after > (time.time() if now is None else now):
+        return retry_after
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return time.time() + 30.0
+    return None
+
+
+def is_deferred_state_active(progress_dir: Path, stock: str, now: float | None = None) -> bool:
+    return deferred_retry_after_epoch(progress_dir, stock, now=now) is not None
+
+
+def active_deferred_status(
+    stocks: dict[str, Path | None],
+    progress_dir: Path,
+    retry_failed: bool = False,
+) -> tuple[int, float | None]:
+    count = 0
+    next_retry: float | None = None
+    now = time.time()
+    for stock in stocks:
+        if has_done_state(progress_dir, stock):
+            continue
+        if has_failed_state(progress_dir, stock) and not retry_failed:
+            continue
+        retry_after = deferred_retry_after_epoch(progress_dir, stock, now=now)
+        if retry_after is None:
+            continue
+        count += 1
+        if next_retry is None or retry_after < next_retry:
+            next_retry = retry_after
+    return count, next_retry
+
+
+def is_retryable_failure_reason(reason: str) -> bool:
+    if reason == "upload_failed":
+        return True
+    if reason.startswith("stage"):
+        return True
+    return reason in {
+        "timeout",
+        "network",
+        "blocked",
+        "resource",
+    }
+
+
+def write_json(path: Path, payload: dict, max_retries: int = 5) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-    os.replace(tmp_path, path)
+    last_error: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        tmp_path = path.with_name(
+            f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}.{attempt}"
+        )
+        try:
+            with tmp_path.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+            os.replace(tmp_path, path)
+            return
+        except (PermissionError, FileNotFoundError) as exc:
+            last_error = exc
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+            if attempt == max_retries:
+                raise
+            delay = 0.5 * attempt
+            print(f"[write_json] retry {attempt}/{max_retries} after {delay:.1f}s: {exc}")
+            time.sleep(delay)
+    if last_error is not None:
+        raise last_error
 
 
-def mark_state(progress_dir: Path, stock: str, suffix: str, payload: dict) -> None:
+def mark_state(progress_dir: Path, stock: str, suffix: str, payload: dict) -> bool:
     payload = dict(payload)
     payload.setdefault("stock", stock)
     payload.setdefault("updated_at", now_iso())
+    worker_id = str(payload.get("worker_id") or "")
+    if worker_id and suffix in OWNED_STATE_SUFFIXES:
+        lock_path = state_path(progress_dir, stock, ".lock")
+        lock_worker_id = read_lock_worker_id(lock_path)
+        if lock_worker_id != worker_id:
+            owner = lock_worker_id if lock_worker_id else "missing"
+            print(f"[{worker_id}] skip {stock}{suffix}: lock owner is {owner}")
+            return False
     write_json(state_path(progress_dir, stock, suffix), payload)
+    return True
 
 
 def remove_state(progress_dir: Path, stock: str, suffix: str) -> None:
@@ -222,6 +333,8 @@ def claim_stock(
     if has_done_state(progress_dir, stock):
         return None
     if has_failed_state(progress_dir, stock) and not retry_failed:
+        return None
+    if is_deferred_state_active(progress_dir, stock):
         return None
 
     lock_path = state_path(progress_dir, stock, ".lock")
@@ -255,9 +368,16 @@ def claim_stock(
     return ClaimedStock(stock=stock, source_csv=source_csv or Path(), lock_path=lock_path)
 
 
-def heartbeat(lock_path: Path, stop_event: threading.Event, interval: float) -> None:
+def heartbeat(
+    lock_path: Path,
+    worker_id: str,
+    stop_event: threading.Event,
+    interval: float,
+) -> None:
     while not stop_event.wait(interval):
         try:
+            if read_lock_worker_id(lock_path) != worker_id:
+                return
             os.utime(lock_path, None)
         except OSError:
             return
@@ -268,6 +388,59 @@ def disk_free_gb(path: Path) -> float:
     return usage.free / (1024 ** 3)
 
 
+def estimate_stock_space_gb(crawl_mode: str, ttl_seconds: float = 300.0) -> float:
+    cache_key = (str(DEFAULT_DATA_DIR.resolve()), crawl_mode)
+    now = time.time()
+    cached = SPACE_ESTIMATE_CACHE.get(cache_key)
+    if cached and now - cached[0] < ttl_seconds:
+        return cached[1]
+
+    if crawl_mode == "full":
+        patterns = ("*_full_*.csv",)
+        default_gb = 0.5
+    else:
+        patterns = ("*_enhanced.csv", "*.csv")
+        default_gb = 0.1
+
+    sizes: list[int] = []
+    if DEFAULT_DATA_DIR.exists():
+        candidates: list[Path] = []
+        for pattern in patterns:
+            candidates.extend(DEFAULT_DATA_DIR.glob(pattern))
+        try:
+            candidates = sorted(
+                candidates,
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            candidates = list(candidates)
+        for path in candidates[:200]:
+            try:
+                if path.is_file():
+                    size = path.stat().st_size
+                    if size > 0:
+                        sizes.append(size)
+            except OSError:
+                continue
+
+    if sizes:
+        average_gb = (sum(sizes) / len(sizes)) / (1024 ** 3)
+        estimate = max(default_gb, average_gb * 2)
+    else:
+        estimate = default_gb
+
+    SPACE_ESTIMATE_CACHE[cache_key] = (now, estimate)
+    return estimate
+
+
+def enough_disk_for_stock(args: argparse.Namespace) -> tuple[bool, float, float]:
+    free_gb = disk_free_gb(PROJECT_DIR)
+    estimated_gb = estimate_stock_space_gb(getattr(args, "crawl_mode", "incremental"))
+    required_gb = max(float(args.min_free_gb), estimated_gb * 2)
+    return free_gb >= required_gb, free_gb, required_gb
+
+
 def detail_failed_count(stock: str) -> int:
     path = DEFAULT_TEMP_DIR / f"{stock}_detail_failed.jsonl"
     if not path.exists():
@@ -276,38 +449,40 @@ def detail_failed_count(stock: str) -> int:
         return sum(1 for line in handle if line.strip())
 
 
-def clean_per_stock_temp(stock: str, crawl_mode: str = "incremental") -> None:
+def clean_per_stock_temp(
+    stock: str,
+    crawl_mode: str = "incremental",
+    from_stage: int = 1,
+) -> None:
     """处理某只股票前清理该股票的旧临时产物，避免过期 base/new 被复用。"""
-    patterns = [
-        DEFAULT_TEMP_DIR / f"{stock}_base.csv",
-        DEFAULT_TEMP_DIR / f"{stock}_new_posts.csv",
-        DEFAULT_TEMP_DIR / f"{stock}_full_posts.csv",
-        DEFAULT_TEMP_DIR / f"{stock}_stage1_manifest.json",
-        DEFAULT_TEMP_DIR / f"{stock}_full_manifest.json",
-        DEFAULT_TEMP_DIR / f"{stock}_detail_failed.jsonl",
-        DEFAULT_TEMP_DIR / f"{stock}_content_delta.jsonl",
-        DEFAULT_TEMP_DIR / f"{stock}_detail_checkpoint.json",
-        DEFAULT_TEMP_DIR / f"{stock}_stage2_checkpoint.json",
-        PROJECT_DIR / "temp_export" / f"{stock}_enhanced.csv",
-        PROJECT_DIR / "temp_export" / f"{stock}_full_20090101.csv",
-        PROJECT_DIR / "temp_export" / f"{stock}_comments.csv",
-        PROJECT_DIR / ".pipeline_flags" / f"{stock}_stage1.done",
-        PROJECT_DIR / ".pipeline_flags" / f"{stock}_stage2.done",
-    ]
-    if crawl_mode == "incremental":
+    patterns: list[Path] = []
+    if from_stage <= 1:
         patterns.extend([
-            PROJECT_DIR / "batch_progress" / f"{stock}.lock",
-            PROJECT_DIR / "batch_progress" / f"{stock}.retrying",
+            DEFAULT_TEMP_DIR / f"{stock}_base.csv",
+            DEFAULT_TEMP_DIR / f"{stock}_new_posts.csv",
+            DEFAULT_TEMP_DIR / f"{stock}_full_posts.csv",
+            DEFAULT_TEMP_DIR / f"{stock}_stage1_manifest.json",
+            DEFAULT_TEMP_DIR / f"{stock}_full_manifest.json",
+            PROJECT_DIR / ".pipeline_flags" / f"{stock}_stage1.done",
+            PROJECT_DIR / ".pipeline_flags" / f"{stock}_stage2.done",
         ])
-    else:
+    elif from_stage <= 2:
+        patterns.append(PROJECT_DIR / ".pipeline_flags" / f"{stock}_stage2.done")
+
+    if from_stage <= 3:
         patterns.extend([
-            PROJECT_DIR / "batch_progress_full_20090101" / f"{stock}.lock",
-            PROJECT_DIR / "batch_progress_full_20090101" / f"{stock}.retrying",
+            PROJECT_DIR / "temp_export" / f"{stock}_enhanced.csv",
+            PROJECT_DIR / "temp_export" / f"{stock}_full_20090101.csv",
+            PROJECT_DIR / "temp_export" / f"{stock}_comments.csv",
         ])
     removed = []
     for path in patterns:
         try:
-            if path.exists():
+            if path.is_dir():
+                import shutil as _shutil
+                _shutil.rmtree(path, ignore_errors=True)
+                removed.append(path.name + '/')
+            elif path.exists():
                 path.unlink()
                 removed.append(path.name)
         except OSError:
@@ -317,27 +492,58 @@ def clean_per_stock_temp(stock: str, crawl_mode: str = "incremental") -> None:
 
 
 # ── 实时进度解析 ──
-# Stage 1 full: "000001: [OK] 进度 50/500 页 (10%) | 成功 50 页 | 累计 4000 条 | 耗时 120s | 速度 25.0页/分 | 预计剩余 18分"
+# Stage 1 full (实际英文格式): "000001: [OK] progress 50/500 pages | new_rows 4000 | elapsed 120s | speed 25.0 pages/min | eta 18 min"
 _RE_FULL_S1 = re.compile(
-    r"(\d{6}):\s+\[(?:OK|WARN:\d+)\]\s+进度\s+(\d+)/(\d+)\s+页\s+\((\d+)%\)"
-    r"\s*\|\s*成功\s+(\d+)\s+页\s*\|\s*累计\s+(\d+)\s+条"
-    r"\s*\|\s*耗时\s+(\d+)s\s*\|\s*速度\s+(\d+\.?\d*)页/分\s*\|\s*预计剩余\s+(\d+\.?\d*)分"
+    r"(\d{6}):\s+\[(?:OK|WARN:\d+)\]\s+progress\s+(\d+)/(\d+)\s+pages\s*\|"
+    r"\s*new_rows\s+(\d+)\s*\|"
+    r"\s*elapsed\s+(\d+)s\s*\|"
+    r"\s*speed\s+(\d+\.?\d*)\s*pages/min\s*\|"
+    r"\s*eta\s+(\d+\.?\d*)\s*min"
+)
+# Stage 1 full (兼容旧中文格式): "000001: [OK] 进度 50/500 页 | 成功 50 页 | 累计 4000 条 | 耗时 120s | 速度 25.0页/分 | 预计剩余 18分"
+_RE_FULL_S1_CN = re.compile(
+    r"(\d{6}):\s+\[(?:OK|WARN:\d+)\]\s+进度\s+(\d+)/(\d+)\s+页"
+    r"(?:\s*\((\d+)%\))?"
+    r"\s*\|\s*(?:成功\s+)?(\d+)\s*页?\s*\|"
+    r"\s*(?:累计\s+)?(\d+)\s*条"
+    r"\s*\|\s*耗时\s+(\d+)s\s*\|"
+    r"\s*速度\s+(\d+\.?\d*)\s*页/分\s*\|"
+    r"\s*预计剩余\s+(\d+\.?\d*)\s*分"
 )
 # Stage 2 caifuhao: "000001: [CAIFUHAO] 50/100 (50%) | ok=50 | fail(perm)=0 | retry=0 | 419条/分 | ETA 0分"
 _RE_CAIFUHAO = re.compile(
-    r"(\d{6}):\s+\[CAIFUHAO\]\s+(\d+)/(\d+)\s+\((\d+)%\)"
-    r"\s*\|\s*ok=(\d+)\s*\|\s*fail\(perm\)=(\d+)"
-    r"\s*\|\s*retry=(\d+)\s*\|\s*(\d+\.?\d*)条/分\s*\|\s*ETA\s+(\d+\.?\d*)分"
+    r"(\d{6}):\s+\[CAIFUHAO(?:-PASS2)?\]\s+(\d+)/(\d+)\s+\((\d+)%\)"
+    r"\s*\|\s*ok=(\d+)\s*\|"
+    r"\s*fail(?:\(perm\))?=(\d+)"
+    r"(?:\s*\|\s*retry=(\d+))?"
+    r"\s*\|\s*(\d+\.?\d*)\s*条/分\s*\|"
+    r"\s*ETA\s+(\d+\.?\d*)\s*分"
+)
+# Stage 2 guba parallel: "000001: 股吧 50/200 (25.0%) [worker-1] 成功, 空3, 延迟1.5s"
+_RE_GUBA_PARALLEL = re.compile(
+    r"(\d{6}):\s+股吧\s+(\d+)/(\d+)\s+\((\d+\.?\d*)%\)"
+    r"(?:\s+\[worker-\d+\])?"
+    r"\s+成功,?\s*空(\d+)"
+)
+# Stage 2 guba single: "000001: 股吧 50/200 (25.0%) 成功, 空3, 延迟1.5s"
+_RE_GUBA_SINGLE = re.compile(
+    r"(\d{6}):\s+股吧\s+(\d+)/(\d+)\s+\((\d+\.?\d*)%\)\s+成功,?\s*空(\d+)"
 )
 # Stage 1 incremental: "000001: 已经成功爬取第 5 页帖子基本信息"
 _RE_INC_S1 = re.compile(
     r"(\d{6}):\s+已经成功爬取第\s+(\d+)\s+页帖子基本信息"
 )
 # Stage done markers
-_RE_S1_DONE = re.compile(r"(\d{6}):\s+(?:全量列表爬取完成|成功爬取.*共\s+\d+\s+页帖子)")
-_RE_S2_DONE = re.compile(r"(\d{6}):\s+(?:财富号爬取完成|正文爬取完成|guba.*爬取完成)")
-_RE_S3_DONE = re.compile(r"\[Stage\s+3(?:\s+full)?\]\s+全部完成！")
-_RE_STAGE_DONE = re.compile(r"\[Stage\s+(\d)(?:\s+full)?\]\s+完成！")
+_RE_S1_DONE = re.compile(
+    r"(\d{6}):\s+(?:全量列表爬取完成|full list crawl done|成功爬取.*共\s+\d+\s+页帖子|正文爬取完成.*共处理)"
+    r"|\[Stage 1(?:\s+full)?\]\s+(?:complete|完成)"
+)
+_RE_S2_DONE = re.compile(
+    r"(\d{6}):\s+(?:财富号爬取完成|正文爬取完成|guba.*爬取完成|股吧原生帖子.*爬取完成|股吧原生帖子.*并发完成|共处理\s+\d+\s+条帖子)"
+    r"|\[Stage 2(?:\s+full)?\]\s+完成"
+)
+_RE_S3_DONE = re.compile(r"\[Stage\s+3(?:\s+full)?\]\s+(?:全部完成|完成|all complete|done)")
+_RE_STAGE_DONE = re.compile(r"\[Stage\s+(\d)(?:\s+full)?\]\s+(?:完成！|完成|全部完成|complete|done)")
 
 # ── 进度文件写入 ──
 PROGRESS_SUFFIX = ".progress.json"
@@ -350,24 +556,40 @@ def write_live_progress(progress_dir: Path, stock: str, payload: dict) -> None:
     payload.setdefault("stock", stock)
     payload.setdefault("updated_at", now_iso())
     path = progress_dir / f"{stock}{PROGRESS_SUFFIX}"
-    progress_dir.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-    os.replace(tmp, path)
+    write_json(path, payload)
 
 
 def parse_progress_line(line: str, stage: int, stock: str) -> dict | None:
     """从 auto_pipeline 的一行输出中提取进度信息。"""
     if stage == 1:
+        # 优先匹配英文格式（当前实际输出）
         m = _RE_FULL_S1.search(line)
         if m:
+            done_pages = int(m.group(2))
+            total_pages = int(m.group(3))
+            pct = int(done_pages / total_pages * 100) if total_pages > 0 else 0
             return {
                 "stage": 1, "stage_label": "Stage 1",
                 "status": "running",
                 "progress": f"{m.group(2)}/{m.group(3)}",
-                "pct": int(m.group(4)),
+                "pct": pct,
+                "ok_pages": done_pages,
+                "total_rows": int(m.group(4)),
+                "elapsed": f"{m.group(5)}s",
+                "speed": f"{m.group(6)}页/分",
+                "eta": f"{m.group(7)}分",
+            }
+        # 兼容旧中文格式
+        m = _RE_FULL_S1_CN.search(line)
+        if m:
+            pct = int(m.group(4)) if m.group(4) else (
+                int(int(m.group(2)) / int(m.group(3)) * 100) if m.group(3) and int(m.group(3)) > 0 else 0
+            )
+            return {
+                "stage": 1, "stage_label": "Stage 1",
+                "status": "running",
+                "progress": f"{m.group(2)}/{m.group(3)}",
+                "pct": pct,
                 "ok_pages": int(m.group(5)),
                 "total_rows": int(m.group(6)),
                 "elapsed": f"{m.group(7)}s",
@@ -395,9 +617,27 @@ def parse_progress_line(line: str, stage: int, stock: str) -> dict | None:
                 "pct": int(m.group(4)),
                 "ok": int(m.group(5)),
                 "fail_perm": int(m.group(6)),
-                "retry": int(m.group(7)),
+                "retry": int(m.group(7)) if m.group(7) else 0,
                 "speed": f"{m.group(8)}条/分",
                 "eta": f"{m.group(9)}分",
+            }
+        # 股吧并发/单线程进度
+        m = _RE_GUBA_PARALLEL.search(line)
+        if not m:
+            m = _RE_GUBA_SINGLE.search(line)
+        if m:
+            done = int(m.group(2))
+            total = int(m.group(3))
+            pct = int(float(m.group(4)))
+            return {
+                "stage": 2, "stage_label": "Stage 2",
+                "status": "running",
+                "progress": f"{m.group(2)}/{m.group(3)}",
+                "pct": pct,
+                "ok": done,
+                "empty": int(m.group(5)),
+                "speed": "",
+                "eta": "",
             }
         if _RE_S2_DONE.search(line):
             return {"stage": 2, "stage_label": "Stage 2", "status": "done"}
@@ -415,7 +655,18 @@ def parse_progress_line(line: str, stage: int, stock: str) -> dict | None:
     return None
 
 
-def stream_subprocess(cmd: list[str], stage: int, stock: str, progress_dir: Path | None = None) -> StageResult:
+def stream_subprocess(
+    cmd: list[str],
+    stage: int,
+    stock: str,
+    progress_dir: Path | None = None,
+    idle_timeout: float = 3600.0,
+) -> StageResult:
+    """Run subprocess with idle-timeout detection.
+
+    If no output is produced for `idle_timeout` seconds, the process is killed
+    and the result is marked as a timeout failure.
+    """
     started = time.time()
     print(f"[{stock}][stage {stage}] running: {' '.join(cmd)}")
     process = subprocess.Popen(
@@ -428,18 +679,65 @@ def stream_subprocess(cmd: list[str], stage: int, stock: str, progress_dir: Path
         errors="replace",
     )
     tail: list[str] = []
-    assert process.stdout is not None
-    for line in process.stdout:
-        print(f"[{stock}][stage {stage}] {line}", end="")
-        tail.append(line)
-        if len(tail) > 200:
-            tail = tail[-200:]
-        # 实时进度解析
-        if progress_dir is not None:
-            progress = parse_progress_line(line, stage, stock)
-            if progress is not None:
-                write_live_progress(progress_dir, stock, progress)
+    last_line_time = time.time()
+    done_event = threading.Event()
+    reader_error: list[Exception | None] = [None]
+
+    def reader() -> None:
+        nonlocal last_line_time, tail
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                print(f"[{stock}][stage {stage}] {line}", end="")
+                tail.append(line)
+                if len(tail) > 200:
+                    tail = tail[-200:]
+                last_line_time = time.time()
+                # 实时进度解析
+                if progress_dir is not None:
+                    progress = parse_progress_line(line, stage, stock)
+                    if progress is not None:
+                        write_live_progress(progress_dir, stock, progress)
+        except Exception as exc:
+            reader_error[0] = exc
+        finally:
+            done_event.set()
+
+    reader_thread = threading.Thread(target=reader, daemon=True)
+    reader_thread.start()
+
+    # Poll for idle timeout
+    while not done_event.is_set():
+        reader_thread.join(timeout=5)
+        if not done_event.is_set():
+            idle = time.time() - last_line_time
+            if idle > idle_timeout:
+                print(
+                    f"[{stock}][stage {stage}] TIMEOUT: no output for {idle:.0f}s "
+                    f"(limit={idle_timeout:.0f}s), killing process..."
+                )
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
+                seconds = time.time() - started
+                tail.append(f"\n[TIMEOUT] idle for {idle:.0f}s, killed by batch_worker\n")
+                return StageResult(
+                    returncode=-1,
+                    seconds=seconds,
+                    output_tail="".join(tail),
+                )
+
+    if reader_error[0] is not None:
+        print(f"[{stock}][stage {stage}] reader error: {reader_error[0]}")
+
     returncode = process.wait()
+    if process.stdout is not None:
+        process.stdout.close()
     seconds = time.time() - started
     print(f"[{stock}][stage {stage}] exit={returncode}, seconds={seconds:.1f}")
     return StageResult(returncode=returncode, seconds=seconds, output_tail="".join(tail))
@@ -485,7 +783,26 @@ def build_stage_cmd(
 
 def classify_stage_failure(stage: int, result: StageResult) -> str:
     tail = result.output_tail
-    if stage == 3 and ("上传失败" in tail or "upload" in tail.lower()):
+    tail_lower = tail.lower()
+    if result.returncode == -1 and "TIMEOUT" in tail:
+        return f"stage{stage}_timeout"
+    if "validate" in tail_lower or "blocked" in tail_lower or "captcha" in tail_lower:
+        return f"stage{stage}_blocked"
+    if (
+        "connectionerror" in tail_lower
+        or "timeout" in tail_lower
+        or "read timed out" in tail_lower
+        or "connection aborted" in tail_lower
+    ):
+        return f"stage{stage}_network"
+    if (
+        "memoryerror" in tail_lower
+        or "no space left" in tail_lower
+        or "disk" in tail_lower
+        or "winerror 112" in tail_lower
+    ):
+        return f"stage{stage}_resource"
+    if stage == 3 and ("上传失败" in tail or "upload" in tail_lower):
         return "upload_failed"
     return f"stage{stage}_exit_{result.returncode}"
 
@@ -544,13 +861,16 @@ def run_stock_pipeline(
             summary.update({"failed_reason": reason, "finished_at": now_iso()})
             return False, summary, reason
 
-    # 每次尝试前都清理该股票的旧临时产物，保证 Stage 1 从干净状态开始
-    clean_per_stock_temp(stock, crawl_mode=crawl_mode)
-
     total_started = time.time()
     final_reason = ""
+    restart_from_stage = 1
 
     for attempt in range(1, args.max_retries + 2):
+        clean_per_stock_temp(
+            stock,
+            crawl_mode=crawl_mode,
+            from_stage=restart_from_stage,
+        )
         summary["attempts"] = attempt
         if attempt > 1:
             mark_state(
@@ -565,9 +885,19 @@ def run_stock_pipeline(
                 },
             )
 
+        stock_timeout = getattr(args, "stock_timeout_minutes", 60) * 60.0
         failed_stage = None
         failed_result = None
-        for stage in (1, 2, 3):
+        for stage in range(restart_from_stage, 4):
+            stage_list_source = getattr(args, "list_source", "html")
+            if (
+                stage == 1
+                and crawl_mode == "full"
+                and attempt >= 3
+                and stage_list_source != "selenium"
+            ):
+                stage_list_source = "selenium"
+                print(f"[{stock}][stage 1] fallback to selenium after repeated failures")
             result = stream_subprocess(
                 build_stage_cmd(
                     args.python,
@@ -578,12 +908,13 @@ def run_stock_pipeline(
                     crawl_mode=crawl_mode,
                     start_date=start_date,
                     list_workers=list_workers,
-                    list_source=getattr(args, "list_source", "html"),
+                    list_source=stage_list_source,
                     list_page_limit=list_page_limit,
                 ),
                 stage=stage,
                 stock=stock,
                 progress_dir=args.progress_dir,
+                idle_timeout=stock_timeout,
             )
             summary[f"stage{stage}_seconds"] = round(
                 summary[f"stage{stage}_seconds"] + result.seconds, 2
@@ -592,6 +923,7 @@ def run_stock_pipeline(
                 failed_stage = stage
                 failed_result = result
                 final_reason = classify_stage_failure(stage, result)
+                restart_from_stage = stage
                 break
 
         if failed_stage is None:
@@ -639,15 +971,47 @@ def run_stock_pipeline(
     return False, summary, final_reason
 
 
-def write_summary(progress_dir: Path, stock: str, summary: dict) -> None:
+def write_summary(progress_dir: Path, stock: str, summary: dict) -> bool:
+    worker_id = str(summary.get("worker_id") or "")
+    if worker_id:
+        lock_worker_id = read_lock_worker_id(state_path(progress_dir, stock, ".lock"))
+        if lock_worker_id != worker_id:
+            owner = lock_worker_id if lock_worker_id else "missing"
+            print(f"[{worker_id}] skip {stock}.summary.json: lock owner is {owner}")
+            return False
     write_json(state_path(progress_dir, stock, ".summary.json"), summary)
+    return True
 
 
-def process_claim(claim: ClaimedStock, args: argparse.Namespace, source_dirs: list[Path]) -> bool:
+def defer_claim(
+    claim: ClaimedStock,
+    args: argparse.Namespace,
+    reason: str,
+    summary: dict,
+) -> bool:
+    retry_seconds = float(getattr(args, "deferred_retry_seconds", 900.0))
+    retry_after = time.time() + max(1.0, retry_seconds)
+    remove_state(args.progress_dir, claim.stock, ".retrying")
+    return mark_state(
+        args.progress_dir,
+        claim.stock,
+        DEFERRED_SUFFIX,
+        {
+            "worker_id": args.worker_id,
+            "reason": reason,
+            "summary": f"{claim.stock}.summary.json",
+            "retry_after_epoch": retry_after,
+            "retry_after": datetime.fromtimestamp(retry_after).isoformat(timespec="seconds"),
+            "attempts": summary.get("attempts", 0),
+        },
+    )
+
+
+def process_claim(claim: ClaimedStock, args: argparse.Namespace, source_dirs: list[Path]) -> str:
     stop_event = threading.Event()
     heartbeat_thread = threading.Thread(
         target=heartbeat,
-        args=(claim.lock_path, stop_event, args.heartbeat_seconds),
+        args=(claim.lock_path, args.worker_id, stop_event, args.heartbeat_seconds),
         daemon=True,
     )
     heartbeat_thread.start()
@@ -660,13 +1024,20 @@ def process_claim(claim: ClaimedStock, args: argparse.Namespace, source_dirs: li
         )
         write_summary(args.progress_dir, claim.stock, summary)
         if success:
+            remove_state(args.progress_dir, claim.stock, DEFERRED_SUFFIX)
             mark_state(
                 args.progress_dir,
                 claim.stock,
                 ".done",
                 {"worker_id": args.worker_id, "summary": f"{claim.stock}.summary.json"},
             )
-            return True
+            return "success"
+        if is_retryable_failure_reason(reason):
+            defer_claim(claim, args, reason, summary)
+            print(
+                f"[{args.worker_id}] deferred {claim.stock} after retryable failure: {reason}"
+            )
+            return "deferred"
         if reason == "upload_failed":
             mark_state(
                 args.progress_dir,
@@ -678,7 +1049,7 @@ def process_claim(claim: ClaimedStock, args: argparse.Namespace, source_dirs: li
                     "summary": f"{claim.stock}.summary.json",
                 },
             )
-            return False
+            return "failed"
         mark_state(
             args.progress_dir,
             claim.stock,
@@ -689,12 +1060,15 @@ def process_claim(claim: ClaimedStock, args: argparse.Namespace, source_dirs: li
                 "summary": f"{claim.stock}.summary.json",
             },
         )
-        return False
+        return "failed"
     finally:
         stop_event.set()
         heartbeat_thread.join(timeout=2)
         try:
-            claim.lock_path.unlink()
+            if read_lock_worker_id(claim.lock_path) == args.worker_id:
+                claim.lock_path.unlink()
+            else:
+                print(f"[{args.worker_id}] skip lock cleanup for {claim.stock}: lock not owned")
         except FileNotFoundError:
             pass
         # 清理实时进度文件
@@ -703,25 +1077,68 @@ def process_claim(claim: ClaimedStock, args: argparse.Namespace, source_dirs: li
                 (args.progress_dir / f"{claim.stock}{suff}").unlink()
             except (FileNotFoundError, OSError):
                 pass
+        for tmp_progress in args.progress_dir.glob(f"{claim.stock}{PROGRESS_SUFFIX}.tmp.*"):
+            try:
+                tmp_progress.unlink()
+            except (FileNotFoundError, OSError):
+                pass
+
+
+def release_claim(claim: ClaimedStock, worker_id: str) -> None:
+    try:
+        if read_lock_worker_id(claim.lock_path) == worker_id:
+            claim.lock_path.unlink()
+        else:
+            print(f"[{worker_id}] skip releasing {claim.stock}: lock not owned")
+    except FileNotFoundError:
+        pass
 
 
 def find_next_claim(
     stocks: dict[str, Path | None],
     args: argparse.Namespace,
+    max_wait_seconds: float = 120.0,
+    retry_seconds: float = 30.0,
 ) -> ClaimedStock | None:
     stale_seconds = args.stale_lock_hours * 3600
-    for stock, source_csv in stocks.items():
-        claim = claim_stock(
-            stock,
-            source_csv,
-            args.progress_dir,
-            args.worker_id,
-            stale_seconds=stale_seconds,
-            retry_failed=args.retry_failed,
+    started_at = time.time()
+    while True:
+        pending_or_busy = 0
+        for stock, source_csv in stocks.items():
+            if is_deferred_state_active(args.progress_dir, stock):
+                continue
+            if not has_done_state(args.progress_dir, stock) and (
+                args.retry_failed or not has_failed_state(args.progress_dir, stock)
+            ):
+                pending_or_busy += 1
+            claim = claim_stock(
+                stock,
+                source_csv,
+                args.progress_dir,
+                args.worker_id,
+                stale_seconds=stale_seconds,
+                retry_failed=args.retry_failed,
+            )
+            if claim is not None:
+                return claim
+
+        if pending_or_busy == 0:
+            return None
+
+        elapsed = time.time() - started_at
+        if elapsed >= max_wait_seconds:
+            print(
+                f"[{args.worker_id}] no claimable stock after {elapsed:.0f}s wait; "
+                f"{pending_or_busy} pending/busy"
+            )
+            return None
+
+        delay = min(retry_seconds, max_wait_seconds - elapsed)
+        print(
+            f"[{args.worker_id}] all pending stocks locked/busy "
+            f"({pending_or_busy}); retrying in {delay:.0f}s"
         )
-        if claim is not None:
-            return claim
-    return None
+        time.sleep(delay)
 
 
 def run_dry_run(stocks: dict[str, Path | None], limit: int | None) -> int:
@@ -739,6 +1156,9 @@ def worker_loop(args: argparse.Namespace, stocks: dict[str, Path | None], source
     processed = 0
     successes = 0
     failures = 0
+    deferred = 0
+    consecutive_failures = 0
+    max_consecutive = getattr(args, "max_consecutive_failures", 5)
 
     while args.limit is None or processed < args.limit:
         free_gb = disk_free_gb(PROJECT_DIR)
@@ -752,18 +1172,57 @@ def worker_loop(args: argparse.Namespace, stocks: dict[str, Path | None], source
 
         claim = find_next_claim(stocks, args)
         if claim is None:
+            deferred_count, next_retry = active_deferred_status(
+                stocks,
+                args.progress_dir,
+                retry_failed=args.retry_failed,
+            )
+            if deferred_count and next_retry is not None:
+                wait_seconds = max(1.0, min(next_retry - time.time(), args.disk_wait_seconds))
+                retry_at = datetime.fromtimestamp(next_retry).isoformat(timespec="seconds")
+                print(
+                    f"[{args.worker_id}] {deferred_count} deferred stock(s); "
+                    f"next retry at {retry_at}, waiting {wait_seconds:.0f}s"
+                )
+                time.sleep(wait_seconds)
+                continue
             print(f"[{args.worker_id}] no pending stock left")
             break
 
         print(f"[{args.worker_id}] claimed {claim.stock}: {claim.source_csv}")
+        enough_space, free_gb, required_gb = enough_disk_for_stock(args)
+        if not enough_space:
+            print(
+                f"[{args.worker_id}] disk free {free_gb:.2f}GB < projected "
+                f"{required_gb:.2f}GB for {claim.stock}; releasing claim and waiting "
+                f"{args.disk_wait_seconds}s"
+            )
+            release_claim(claim, args.worker_id)
+            time.sleep(args.disk_wait_seconds)
+            continue
+
         processed += 1
-        if process_claim(claim, args, source_dirs=source_dirs):
+        status = process_claim(claim, args, source_dirs=source_dirs)
+        if status == "success":
             successes += 1
+            consecutive_failures = 0
+        elif status == "deferred":
+            deferred += 1
+            consecutive_failures = 0
         else:
             failures += 1
+            consecutive_failures += 1
+            if consecutive_failures >= max_consecutive:
+                print(
+                    f"[{args.worker_id}] {consecutive_failures} consecutive failures "
+                    f"(max={max_consecutive}); stopping to avoid IP ban. "
+                    f"Restart with --retry-failed after resolving network issues."
+                )
+                break
 
     print(
-        f"[{args.worker_id}] finished: processed={processed}, success={successes}, failure={failures}"
+        f"[{args.worker_id}] finished: processed={processed}, success={successes}, "
+        f"deferred={deferred}, failure={failures}"
     )
     return 1 if failures else 0
 
@@ -788,11 +1247,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--progress-dir", type=Path, default=None)
     parser.add_argument("--detail-workers", type=int, default=3)
     parser.add_argument("--max-retries", type=int, default=2)
-    parser.add_argument("--stale-lock-hours", type=float, default=3.0)
+    parser.add_argument("--stale-lock-hours", type=float, default=1.0)
     parser.add_argument("--heartbeat-seconds", type=float, default=60.0)
     parser.add_argument("--min-free-gb", type=float, default=20.0)
     parser.add_argument("--disk-wait-seconds", type=float, default=300.0)
+    parser.add_argument("--deferred-retry-seconds", type=float, default=900.0,
+                        help="Seconds before retrying retryable stock failures (default 900)")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--stock-timeout-minutes", type=float, default=60.0,
+                        help="Max idle minutes per stock stage before killing (default 60)")
+    parser.add_argument("--max-consecutive-failures", type=int, default=5,
+                        help="Max consecutive failures before stopping worker to avoid IP ban (default 5)")
     parser.add_argument("--stock", action="append", default=None,
                         help="Restrict processing to one stock; may be provided multiple times")
     parser.add_argument("--retry-failed", action="store_true",
@@ -816,11 +1281,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.crawl_mode == "full":
         if args.stock_list is None:
-            default_list = PROJECT_DIR / "数据_list.csv"
-            if default_list.exists():
-                args.stock_list = default_list
+            list_candidates = sorted(PROJECT_DIR.glob("*_list.csv"))
+            if list_candidates:
+                args.stock_list = list_candidates[0]
             else:
-                print("[error] full mode requires --stock-list or 数据_list.csv in project dir")
+                print("[error] full mode requires --stock-list or *_list.csv in project dir")
                 return 1
         stocks = load_stock_list(args.stock_list)
         stocks = filter_stocks(stocks, args.stock)
@@ -832,9 +1297,6 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         stocks = discover_stock_csvs(source_dirs)
         stocks = filter_stocks(stocks, args.stock)
-
-    if args.limit is not None:
-        stocks = dict(list(stocks.items())[:args.limit])
 
     if not stocks:
         print("[error] no stock tasks discovered")

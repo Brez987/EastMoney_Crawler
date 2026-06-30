@@ -217,6 +217,21 @@ class PostParser(object):
             text = match.group(1)
         return json.loads(text)
 
+    @staticmethod
+    def _response_text(resp) -> str:
+        try:
+            return resp.text or ''
+        except (UnicodeDecodeError, LookupError):
+            content = getattr(resp, 'content', b'') or b''
+            if isinstance(content, str):
+                return content
+            for encoding in ('utf-8', 'gbk', 'latin-1'):
+                try:
+                    return content.decode(encoding, errors='replace')
+                except (UnicodeDecodeError, LookupError):
+                    continue
+            return ''
+
     def _clean_caifuhao_api_content(self, raw_content: str) -> str:
         if not raw_content:
             return ''
@@ -309,7 +324,7 @@ class PostParser(object):
                     result['reason'] = f'http_{brief_resp.status_code}'
                     return result
 
-                brief_data = self._parse_json_or_jsonp(brief_resp.text)
+                brief_data = self._parse_json_or_jsonp(self._response_text(brief_resp))
                 brief_item = ((brief_data.get('re') or [{}])[0] or {})
                 mapped_post_id = str(brief_item.get('post_id') or '').strip()
                 if mapped_post_id and mapped_post_id.isdigit() and mapped_post_id != '0':
@@ -346,7 +361,7 @@ class PostParser(object):
                 result['reason'] = f'http_{resp.status_code}'
                 return result
 
-            data = self._parse_json_or_jsonp(resp.text)
+            data = self._parse_json_or_jsonp(self._response_text(resp))
             post = data.get('post') or {}
             if not data.get('rc') or not post:
                 message = str(data.get('me') or data.get('message') or '')
@@ -449,7 +464,7 @@ class PostParser(object):
                 result['reason'] = 'invalid_article'
                 return result
 
-            text = resp.text or ''
+            text = self._response_text(resp)
             if self._looks_like_blocked_html(text[:8000], final_url):
                 result['reason'] = 'blocked_validation'
                 return result
@@ -825,33 +840,14 @@ class PostParser(object):
 
     @staticmethod
     def _parse_forward(html) -> str:
-        """提取帖子的转发数（整数）"""
-        try:
-            # 方案1：尝试从转发数所在的 span/em 标签提取
-            for selector in [
-                'td:nth-child(5) > div',       # 可能在第5列
-                'td:nth-child(5)',
-                'span.forward_num',
-                'em.forward',
-                'td.l3 > span',
-                'td.l3',
-            ]:
-                try:
-                    el = html.find_element(By.CSS_SELECTOR, selector)
-                    text = el.text.strip()
-                    if text and text.isdigit():
-                        return text
-                    # 处理"1.2万"格式
-                    if text and '万' in text:
-                        num = text.replace('万', '')
-                        try:
-                            return str(int(float(num) * 10000))
-                        except Exception:
-                            pass
-                except Exception:
-                    continue
-        except Exception:
-            pass
+        """提取帖子的转发数（整数）。
+
+        注意：当前东方财富股吧列表页 HTML 表格仅有 5 列（阅读、评论、标题、作者、发帖时间），
+        转发数不在可见 HTML 中展示，仅存在于页面内嵌的 article_list JSON 中。
+        Selenium DOM 回退路径无法从 HTML 表格获取转发数，因此返回 '0'。
+        转发数的正确提取通过 API 路径（_article_to_post_info）从 post_forward_count 获取。
+        """
+        # 当前页面布局中没有转发数列，无法从 DOM 读取，返回 0
         return '0'
 
 

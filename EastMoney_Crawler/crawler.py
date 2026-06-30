@@ -315,6 +315,7 @@ class PostCrawler(object):
             'post_title': article.get('post_title') or '',
             'post_view': self._normalise_count(article.get('post_click_count')),
             'comment_num': self._normalise_count(article.get('post_comment_count')),
+            'like_num': self._normalise_count(article.get('post_like_count')),
             'post_url': post_url,
             'post_date': post_date,
             'post_time': post_time,
@@ -602,7 +603,7 @@ class PostCrawler(object):
         total = len(posts_to_crawl)
         if total == 0:
             print(f'{self.symbol}: 未找到需要爬取正文的帖子')
-            return
+            return True
 
         # 分离财富号和非财富号帖子
         caifuhao_posts = [p for p in posts_to_crawl if 'caifuhao' in p.get('post_url', '')]
@@ -617,7 +618,8 @@ class PostCrawler(object):
 
         # 先爬财富号帖子（多线程 requests）
         if caifuhao_posts:
-            self._crawl_caifuhao_posts(caifuhao_posts, update_callback, max_workers=worker_count)
+            if not self._crawl_caifuhao_posts(caifuhao_posts, update_callback, max_workers=worker_count):
+                return False
 
         # 爬非财富号帖子
         if guba_posts:
@@ -627,6 +629,7 @@ class PostCrawler(object):
                 self._crawl_guba_posts(guba_posts, update_callback)
 
         print(f'{self.symbol}: 正文爬取完成，共处理 {total} 条帖子')
+        return True
 
     def _crawl_caifuhao_posts(self, posts: list, update_callback, max_workers: int = 3):
         """高速财富号正文爬取（WAP API 主路径 + curl_cffi 兜底 + 窗口分批）
@@ -682,6 +685,7 @@ class PostCrawler(object):
         success_ids = set()
         permanent_fail_ids = set()
         blocked_ids = set()
+        hard_blocked_ids = set()
         lock = threading.Lock()
         start_time = time.time()
         consecutive_blocks = 0
@@ -689,7 +693,7 @@ class PostCrawler(object):
         # 永久失效原因：文章确实不存在/已删除
         PERMANENT_FAIL_REASONS = {
             'http_404', 'http_410', 'invalid_article', 'invalid_page_marker',
-            'missing_source_id', 'missing_post_id',
+            'missing_source_id',
         }
         # 可重试原因：临时封禁/超时/空正文
         RETRYABLE_REASONS = {
@@ -776,6 +780,7 @@ class PostCrawler(object):
                             blocked_ids.add(post_id)
                             window_blocked += 1
                             if reason in ('http_403', 'http_429', 'blocked_validation'):
+                                hard_blocked_ids.add(post_id)
                                 consecutive_blocks += 1
                         else:
                             # 未知原因也归入可重试
@@ -799,6 +804,13 @@ class PostCrawler(object):
             if wstart + WINDOW_SIZE < total and not global_blocked:
                 time.sleep(random.uniform(*WINDOW_PAUSE))
 
+        if hard_blocked_ids:
+            print(
+                f'{self.symbol}: [CAIFUHAO] blocked by validation/rate limit; '
+                f'pausing {len(hard_blocked_ids)} retryable posts without marking failed'
+            )
+            return False
+
         # ===== Pass 2：单线程重试被阻断的帖子（WAP API + 长延迟）=====
         if blocked_ids:
             retry_posts = [p for p in posts if p['_id'] in blocked_ids]
@@ -806,7 +818,10 @@ class PostCrawler(object):
                   f'(单线程, delay=1-3s, 冷却后刷新Cookie)...')
             time.sleep(random.uniform(30, 60))
             self._caifuhao_cookie_bootstrapped = False
-            self._bootstrap_caifuhao_session_via_browser()
+            try:
+                self._bootstrap_caifuhao_session_via_browser()
+            except Exception as e:
+                print(f'{self.symbol}: [CAIFUHAO-PASS2] cookie refresh failed, continue with WAP API: {e}')
             retry_session = self._caifuhao_session
 
             retry_ok = 0
@@ -833,13 +848,21 @@ class PostCrawler(object):
                         if detail.get(k):
                             update_data[k] = detail[k]
                     update_callback(post_id, update_data)
+                    success_ids.add(post_id)
+                    blocked_ids.discard(post_id)
                     retry_ok += 1
-                else:
+                elif detail.get('reason') in PERMANENT_FAIL_REASONS:
                     reason = detail.get('reason', 'unknown')
                     update_callback(post_id, {
                         'post_content': '', '_detail_failed': True,
-                        'reason': f'retry_failed:{reason}', 'post_url': url
+                        'reason': reason, 'post_url': url
                     })
+                    permanent_fail_ids.add(post_id)
+                    blocked_ids.discard(post_id)
+                    retry_fail += 1
+                else:
+                    reason = detail.get('reason', 'unknown')
+                    print(f'{self.symbol}: [CAIFUHAO-PASS2] retryable failure for {post_id}: {reason}')
                     retry_fail += 1
                 if (i + 1) % 20 == 0:
                     print(f'{self.symbol}: [CAIFUHAO-PASS2] {i+1}/{len(retry_posts)} '
@@ -854,6 +877,7 @@ class PostCrawler(object):
         print(f'{self.symbol}: 财富号爬取完成 [{status}] '
               f'成功 {len(success_ids)}，永久失效 {len(permanent_fail_ids)}，'
               f'总耗时 {total_elapsed:.0f}s ({total_elapsed/60:.1f}分)')
+        return not any(p['_id'] in blocked_ids and p['_id'] not in success_ids for p in posts)
 
     def _crawl_guba_posts(self, posts: list, update_callback):
         """单线程爬取股吧原生帖子（JS fetch API + 自适应延迟）
