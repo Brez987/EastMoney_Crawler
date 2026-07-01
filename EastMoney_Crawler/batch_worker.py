@@ -746,22 +746,25 @@ def stream_subprocess(
 def build_stage_cmd(
     python_bin: str,
     stock: str,
-    stage: int,
+    stage: int | str,
     source_dirs: list[Path],
     detail_workers: int,
     crawl_mode: str = "incremental",
     start_date: str = "2009-01-01",
     list_workers: int = 6,
+    list_window_pause_min: float = 0.3,
+    list_window_pause_max: float = 1.2,
     list_source: str = "html",
     list_page_limit: int = 0,
 ) -> list[str]:
+    stage_value = str(stage)
     cmd = [
         python_bin,
         str(AUTO_PIPELINE),
         "--stock",
         stock,
         "--stage",
-        str(stage),
+        stage_value,
         "--crawl-mode",
         crawl_mode,
     ]
@@ -769,42 +772,52 @@ def build_stage_cmd(
         cmd.extend([
             "--start-date", start_date,
             "--list-workers", str(list_workers),
+            "--list-window-pause-min", str(list_window_pause_min),
+            "--list-window-pause-max", str(list_window_pause_max),
             "--list-source", list_source,
         ])
         if list_page_limit:
             cmd.extend(["--list-page-limit", str(list_page_limit)])
-    if stage == 1 and crawl_mode == "incremental":
+    if stage_value in {"1", "all"} and crawl_mode == "incremental":
         for source_dir in source_dirs:
             cmd.extend(["--source-dir", str(source_dir)])
-    if stage == 2:
+    if stage_value in {"2", "all"}:
         cmd.extend(["--detail-workers", str(detail_workers)])
     return cmd
 
 
-def classify_stage_failure(stage: int, result: StageResult) -> str:
+def classify_stage_failure(stage: int | str, result: StageResult) -> str:
     tail = result.output_tail
     tail_lower = tail.lower()
+    stage_label = str(stage)
     if result.returncode == -1 and "TIMEOUT" in tail:
-        return f"stage{stage}_timeout"
+        return f"stage{stage_label}_timeout"
     if "validate" in tail_lower or "blocked" in tail_lower or "captcha" in tail_lower:
-        return f"stage{stage}_blocked"
+        return f"stage{stage_label}_blocked"
     if (
         "connectionerror" in tail_lower
         or "timeout" in tail_lower
         or "read timed out" in tail_lower
         or "connection aborted" in tail_lower
     ):
-        return f"stage{stage}_network"
+        return f"stage{stage_label}_network"
     if (
         "memoryerror" in tail_lower
         or "no space left" in tail_lower
         or "disk" in tail_lower
         or "winerror 112" in tail_lower
     ):
-        return f"stage{stage}_resource"
-    if stage == 3 and ("上传失败" in tail or "upload" in tail_lower):
+        return f"stage{stage_label}_resource"
+    if stage_label in {"3", "all"} and ("上传失败" in tail or "upload" in tail_lower):
         return "upload_failed"
-    return f"stage{stage}_exit_{result.returncode}"
+    return f"stage{stage_label}_exit_{result.returncode}"
+
+
+def extract_stage_timings(output_tail: str) -> dict[int, float]:
+    timings: dict[int, float] = {}
+    for match in re.finditer(r"\[STAGE_TIMING\]\s+stage=(\d)\s+seconds=(\d+(?:\.\d+)?)", output_tail):
+        timings[int(match.group(1))] = float(match.group(2))
+    return timings
 
 
 def output_csv_size_mb(stock: str, crawl_mode: str = "incremental") -> float:
@@ -833,6 +846,8 @@ def run_stock_pipeline(
     crawl_mode = getattr(args, "crawl_mode", "incremental")
     start_date = getattr(args, "start_date", "2009-01-01")
     list_workers = getattr(args, "list_workers", 6)
+    list_window_pause_min = getattr(args, "list_window_pause_min", 0.3)
+    list_window_pause_max = getattr(args, "list_window_pause_max", 1.2)
     list_page_limit = getattr(args, "list_page_limit", 0)
 
     summary = {
@@ -888,43 +903,83 @@ def run_stock_pipeline(
         stock_timeout = getattr(args, "stock_timeout_minutes", 60) * 60.0
         failed_stage = None
         failed_result = None
-        for stage in range(restart_from_stage, 4):
-            stage_list_source = getattr(args, "list_source", "html")
+        if getattr(args, "single_process_stock", False) and restart_from_stage == 1:
+            single_list_source = getattr(args, "list_source", "html")
             if (
-                stage == 1
-                and crawl_mode == "full"
+                crawl_mode == "full"
                 and attempt >= 3
-                and stage_list_source != "selenium"
+                and single_list_source != "selenium"
             ):
-                stage_list_source = "selenium"
-                print(f"[{stock}][stage 1] fallback to selenium after repeated failures")
+                single_list_source = "selenium"
+                print(f"[{stock}][stage all] fallback to selenium after repeated failures")
             result = stream_subprocess(
                 build_stage_cmd(
                     args.python,
                     stock,
-                    stage,
+                    "all",
                     source_dirs=source_dirs,
                     detail_workers=args.detail_workers,
                     crawl_mode=crawl_mode,
                     start_date=start_date,
                     list_workers=list_workers,
-                    list_source=stage_list_source,
+                    list_window_pause_min=list_window_pause_min,
+                    list_window_pause_max=list_window_pause_max,
+                    list_source=single_list_source,
                     list_page_limit=list_page_limit,
                 ),
-                stage=stage,
+                stage=1,
                 stock=stock,
                 progress_dir=args.progress_dir,
                 idle_timeout=stock_timeout,
             )
-            summary[f"stage{stage}_seconds"] = round(
-                summary[f"stage{stage}_seconds"] + result.seconds, 2
-            )
+            timings = extract_stage_timings(result.output_tail)
+            for stage_num, seconds in timings.items():
+                summary[f"stage{stage_num}_seconds"] = round(seconds, 2)
             if result.returncode != 0:
-                failed_stage = stage
+                failed_stage = "all"
                 failed_result = result
-                final_reason = classify_stage_failure(stage, result)
-                restart_from_stage = stage
-                break
+                final_reason = classify_stage_failure("all", result)
+                restart_from_stage = 1
+        else:
+            for stage in range(restart_from_stage, 4):
+                stage_list_source = getattr(args, "list_source", "html")
+                if (
+                    stage == 1
+                    and crawl_mode == "full"
+                    and attempt >= 3
+                    and stage_list_source != "selenium"
+                ):
+                    stage_list_source = "selenium"
+                    print(f"[{stock}][stage 1] fallback to selenium after repeated failures")
+                result = stream_subprocess(
+                    build_stage_cmd(
+                        args.python,
+                        stock,
+                        stage,
+                        source_dirs=source_dirs,
+                        detail_workers=args.detail_workers,
+                        crawl_mode=crawl_mode,
+                        start_date=start_date,
+                        list_workers=list_workers,
+                        list_window_pause_min=list_window_pause_min,
+                        list_window_pause_max=list_window_pause_max,
+                        list_source=stage_list_source,
+                        list_page_limit=list_page_limit,
+                    ),
+                    stage=stage,
+                    stock=stock,
+                    progress_dir=args.progress_dir,
+                    idle_timeout=stock_timeout,
+                )
+                summary[f"stage{stage}_seconds"] = round(
+                    summary[f"stage{stage}_seconds"] + result.seconds, 2
+                )
+                if result.returncode != 0:
+                    failed_stage = stage
+                    failed_result = result
+                    final_reason = classify_stage_failure(stage, result)
+                    restart_from_stage = stage
+                    break
 
         if failed_stage is None:
             summary.update(
@@ -1240,6 +1295,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Full mode start date (YYYY-MM-DD)")
     parser.add_argument("--list-workers", type=int, default=6,
                         help="Full mode Stage 1 list-page requests workers")
+    parser.add_argument("--list-window-pause-min", type=float, default=0.3,
+                        help="Fast-path Stage 1 window pause lower bound when no failures occur")
+    parser.add_argument("--list-window-pause-max", type=float, default=1.2,
+                        help="Fast-path Stage 1 window pause upper bound when no failures occur")
     parser.add_argument("--list-source", choices=["html", "api", "auto", "selenium"], default="html",
                         help="Full mode Stage 1 list source; html/api/auto use fast requests HTML")
     parser.add_argument("--list-page-limit", type=int, default=0,
@@ -1262,6 +1321,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Restrict processing to one stock; may be provided multiple times")
     parser.add_argument("--retry-failed", action="store_true",
                         help="Allow claiming stocks with .failed/.failed_upload state")
+    parser.add_argument("--single-process-stock", action="store_true",
+                        help="Run Stage 1/2/3 for each stock inside one auto_pipeline.py process")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--python", default=sys.executable)
     return parser

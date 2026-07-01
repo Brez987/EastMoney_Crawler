@@ -639,21 +639,43 @@ class PostCrawler(object):
         每 worker 独立 curl_cffi Session，不共享，避免连接池竞争。
         """
         total = len(posts)
-        WINDOW_SIZE = 50          # 每批 50 条
+        WINDOW_SIZE = 50
         WORKERS = max(1, min(int(max_workers or 3), 6))
-        WINDOW_PAUSE = (2.0, 5.0)   # 批间暂停
-        PER_REQ_DELAY = (0.1, 0.4)  # 请求间微延迟
+        profile = os.environ.get('CAIFUHAO_PROFILE', 'balanced').strip().lower()
+        if profile == 'conservative':
+            WINDOW_PAUSE = (2.0, 5.0)
+            PER_REQ_DELAY = (0.1, 0.4)
+        elif profile == 'fast':
+            WINDOW_PAUSE = (0.1, 0.5)
+            PER_REQ_DELAY = (0.01, 0.06)
+        else:
+            profile = 'balanced'
+            WINDOW_PAUSE = (0.3, 1.2)
+            PER_REQ_DELAY = (0.03, 0.12)
         BLOCK_THRESHOLD = 3         # 连续 403/blocked 触发冷却
         COOLDOWN_TIME = (30.0, 60.0)  # 封禁后冷却
 
-        # 浏览器预热主 Cookie 池（仅一次，供所有 worker 复制）
-        # 非致命：浏览器启动失败时 WAP API 路径仍可正常工作
-        try:
-            self._bootstrap_caifuhao_session_via_browser()
-        except Exception as e:
-            print(f'{self.symbol}: [CAIFUHAO] browser cookie warmup failed (WAP API path still works): {e}')
-        master_cookies = list(self._caifuhao_session.cookies) if self._caifuhao_session is not None else []
+        master_cookies = []
+        cookie_generation = 0
+        lazy_cookie_warmed = False
         parser = PostParser()
+
+        def warm_caifuhao_cookie_if_needed(reason: str = '', force_refresh: bool = False):
+            """Warm browser cookies only after the fast API path shows pressure."""
+            nonlocal master_cookies, cookie_generation, lazy_cookie_warmed
+            if lazy_cookie_warmed and not force_refresh:
+                return
+            lazy_cookie_warmed = True
+            if force_refresh:
+                self._caifuhao_cookie_bootstrapped = False
+            try:
+                self._bootstrap_caifuhao_session_via_browser()
+            except Exception as e:
+                print(f'{self.symbol}: [CAIFUHAO] lazy cookie warmup failed (continuing with WAP API): {e}')
+                return
+            master_cookies = list(self._caifuhao_session.cookies) if self._caifuhao_session is not None else []
+            cookie_generation += 1
+            print(f'{self.symbol}: [CAIFUHAO] lazy cookie warmup done: {reason or "needed"}')
 
         def extract_source_id(post: dict) -> str:
             source_id = str(post.get('post_source_id', '') or '').strip()
@@ -672,7 +694,9 @@ class PostCrawler(object):
         _thread_local = threading.local()
 
         def _worker_session():
-            if getattr(_thread_local, 'session', None) is None:
+            session = getattr(_thread_local, 'session', None)
+            session_cookie_generation = getattr(_thread_local, 'cookie_generation', -1)
+            if session is None or session_cookie_generation != cookie_generation:
                 s = self._new_caifuhao_session()
                 for c in master_cookies:
                     try:
@@ -680,6 +704,7 @@ class PostCrawler(object):
                     except Exception:
                         pass
                 _thread_local.session = s
+                _thread_local.cookie_generation = cookie_generation
             return _thread_local.session
 
         success_ids = set()
@@ -729,7 +754,7 @@ class PostCrawler(object):
             return post_id, detail, url
 
         print(f'{self.symbol}: [CAIFUHAO] WAP API主路径+curl_cffi兜底: total={total}, '
-              f'workers={WORKERS}, window={WINDOW_SIZE}')
+              f'workers={WORKERS}, window={WINDOW_SIZE}, profile={profile}')
 
         window_done = 0
         global_blocked = False
@@ -739,20 +764,14 @@ class PostCrawler(object):
                 print(f'{self.symbol}: [CAIFUHAO] 检测到封禁，冷却 {COOLDOWN_TIME[0]}-{COOLDOWN_TIME[1]}s + 刷新Cookie...')
                 cooldown = random.uniform(*COOLDOWN_TIME)
                 time.sleep(cooldown)
-                self._caifuhao_cookie_bootstrapped = False
-                try:
-                    self._bootstrap_caifuhao_session_via_browser()
-                except Exception as e:
-                    print(f'{self.symbol}: [CAIFUHAO] cooldown cookie refresh failed (continuing with WAP API): {e}')
-                master_cookies.clear()
-                if self._caifuhao_session is not None:
-                    master_cookies.extend(list(self._caifuhao_session.cookies))
+                warm_caifuhao_cookie_if_needed('cooldown refresh', force_refresh=True)
                 # 清除所有 worker 的 thread-local session，下次自动重建
                 global_blocked = False
                 consecutive_blocks = 0
 
             window = posts[wstart:wstart + WINDOW_SIZE]
             window_blocked = 0
+            window_hard_blocked = 0
 
             with ThreadPoolExecutor(max_workers=WORKERS) as executor:
                 futures = {executor.submit(crawl_one, p): p['_id'] for p in window}
@@ -781,6 +800,7 @@ class PostCrawler(object):
                             window_blocked += 1
                             if reason in ('http_403', 'http_429', 'blocked_validation'):
                                 hard_blocked_ids.add(post_id)
+                                window_hard_blocked += 1
                                 consecutive_blocks += 1
                         else:
                             # 未知原因也归入可重试
@@ -797,9 +817,20 @@ class PostCrawler(object):
                   f'retry={len(blocked_ids)} | '
                   f'{speed:.0f}条/分 | ETA {eta:.0f}分')
 
-            if consecutive_blocks >= BLOCK_THRESHOLD or window_blocked > len(window) * 0.3:
+            window_fail_rate = window_blocked / max(len(window), 1)
+            if window_hard_blocked or consecutive_blocks >= BLOCK_THRESHOLD or window_fail_rate > 0.3:
+                if window_hard_blocked:
+                    warm_caifuhao_cookie_if_needed('hard block in window', force_refresh=True)
                 global_blocked = True
                 print(f'{self.symbol}: [CAIFUHAO] 封禁率过高 ({window_blocked}/{len(window)}), 触发冷却')
+            elif window_fail_rate >= 0.05:
+                PER_REQ_DELAY = (0.1, 0.4)
+                WINDOW_PAUSE = (2.0, 5.0)
+                if window_fail_rate >= 0.1:
+                    warm_caifuhao_cookie_if_needed('retryable failure rate high')
+            elif profile == 'balanced':
+                PER_REQ_DELAY = (0.03, 0.12)
+                WINDOW_PAUSE = (0.3, 1.2)
 
             if wstart + WINDOW_SIZE < total and not global_blocked:
                 time.sleep(random.uniform(*WINDOW_PAUSE))
@@ -815,19 +846,14 @@ class PostCrawler(object):
         if blocked_ids:
             retry_posts = [p for p in posts if p['_id'] in blocked_ids]
             print(f'\n{self.symbol}: [CAIFUHAO-PASS2] 重试 {len(retry_posts)} 条阻断帖子 '
-                  f'(单线程, delay=1-3s, 冷却后刷新Cookie)...')
-            time.sleep(random.uniform(30, 60))
-            self._caifuhao_cookie_bootstrapped = False
-            try:
-                self._bootstrap_caifuhao_session_via_browser()
-            except Exception as e:
-                print(f'{self.symbol}: [CAIFUHAO-PASS2] cookie refresh failed, continue with WAP API: {e}')
-            retry_session = self._caifuhao_session
+                  f'(单线程, delay=0.5-1.5s, no browser warmup unless needed)...')
+            time.sleep(random.uniform(3, 8))
+            retry_session = self._caifuhao_session or self._new_caifuhao_session()
 
             retry_ok = 0
             retry_fail = 0
             for i, post in enumerate(retry_posts):
-                time.sleep(random.uniform(1.0, 3.0))
+                time.sleep(random.uniform(0.5, 1.5))
                 post_id = post['_id']
                 source_id = extract_source_id(post)
                 url = caifuhao_url(post)
@@ -1622,6 +1648,14 @@ class PostCrawler(object):
         max_time = None
         pages = [p for p in range(1, boundary_page + 1) if p not in cached_pages]
         total_to_fetch = len(pages)
+        if boundary_page <= 20:
+            effective_list_workers = min(list_workers, 2)
+        elif boundary_page <= 80:
+            effective_list_workers = min(list_workers, 4)
+        else:
+            effective_list_workers = list_workers
+        if effective_list_workers != list_workers:
+            print(f'{self.symbol}: adaptive list workers {list_workers} -> {effective_list_workers} for {boundary_page} pages')
         thread_local = threading.local()
         base_cookies = self.session.cookies.get_dict()
 
@@ -1713,6 +1747,8 @@ class PostCrawler(object):
             fetched_in_pass = 0
             for start in range(0, len(page_list), list_window_size):
                 window = page_list[start:start + list_window_size]
+                window_failed = 0
+                window_blocked = 0
                 if effective_source == 'selenium':
                     workers = 1
                 with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -1727,9 +1763,11 @@ class PostCrawler(object):
                         if result.get('ok'):
                             record_success(page_num, result['kept'], result['all_before'])
                         else:
+                            window_failed += 1
                             failed_pages.add(page_num)
                             pass_failed.add(page_num)
                             if result.get('blocked'):
+                                window_blocked += 1
                                 blocked_pages.add(page_num)
                             else:
                                 transient_failed_pages.add(page_num)
@@ -1747,12 +1785,23 @@ class PostCrawler(object):
 
                 if start + list_window_size < len(page_list):
                     low, high = window_pause_range
-                    time.sleep(random.uniform(max(0, low), max(low, high)))
+                    low = max(0.0, float(low))
+                    high = max(low, float(high))
+                    fail_rate = window_failed / max(len(window), 1)
+                    if window_blocked:
+                        pause = random.uniform(30.0, 60.0)
+                    elif fail_rate >= 0.05:
+                        pause = random.uniform(max(3.0, low), max(8.0, high))
+                    elif fail_rate > 0:
+                        pause = random.uniform(max(1.0, low), max(3.0, high))
+                    else:
+                        pause = random.uniform(low, high)
+                    time.sleep(pause)
             return pass_failed
 
-        first_failed = run_pass(pages, list_workers, 'pass1-fast', allow_fallback=False)
+        first_failed = run_pass(pages, effective_list_workers, 'pass1-fast', allow_fallback=False)
         if first_failed:
-            retry_workers = max(1, list_workers // 2)
+            retry_workers = max(1, effective_list_workers // 2)
             second_failed = run_pass(sorted(first_failed), retry_workers, 'retry-lower-concurrency', allow_fallback=False)
         else:
             second_failed = set()
@@ -1791,7 +1840,7 @@ class PostCrawler(object):
             'retry_after_seconds': retry_after_seconds,
             'skipped_cached_pages': len([p for p in cached_pages if 1 <= p <= boundary_page]),
             'list_window_size': list_window_size,
-            'list_workers': list_workers,
+            'list_workers': effective_list_workers,
             'list_source': effective_source,
             'partial': partial,
             'page_limit': page_limit or 0,

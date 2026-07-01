@@ -94,6 +94,8 @@ CRAWL_MODE = 'incremental'  # 'incremental' | 'full'
 START_DATE = '2009-01-01'
 LIST_WORKERS = 6
 LIST_WINDOW_SIZE = 80
+LIST_WINDOW_PAUSE_MIN = 0.3
+LIST_WINDOW_PAUSE_MAX = 1.2
 LIST_SOURCE = 'html'
 LIST_PAGE_LIMIT = 0
 
@@ -707,6 +709,8 @@ def run_stage1(source_dirs: list = None, force_refresh_base: bool = False, force
             start_date=START_DATE,
             list_workers=LIST_WORKERS,
             list_window_size=LIST_WINDOW_SIZE,
+            list_window_pause_min=LIST_WINDOW_PAUSE_MIN,
+            list_window_pause_max=LIST_WINDOW_PAUSE_MAX,
             list_source=LIST_SOURCE,
             list_page_limit=LIST_PAGE_LIMIT,
             force_full_refresh=force_full_refresh,
@@ -853,6 +857,8 @@ def run_stage1_full(
     start_date: str,
     list_workers: int,
     list_window_size: int = 80,
+    list_window_pause_min: float = 0.3,
+    list_window_pause_max: float = 1.2,
     list_source: str = "html",
     list_page_limit: int = 0,
     force_full_refresh: bool = False,
@@ -861,7 +867,9 @@ def run_stage1_full(
     print(f'\n{"="*60}')
     print(f'[Stage 1 full] {STOCK_CODE} fast list crawl '
           f'(start_date={start_date}, list_source={list_source}, '
-          f'workers={list_workers}, page_limit={list_page_limit or "none"})')
+          f'workers={list_workers}, window={list_window_size}, '
+          f'pause={list_window_pause_min}-{list_window_pause_max}s, '
+          f'page_limit={list_page_limit or "none"})')
     print(f'{"="*60}')
 
     if not check_disk_space(min_gb=1.0):
@@ -894,7 +902,7 @@ def run_stage1_full(
         list_source=list_source,
         cached_pages=cached_pages_set,
         page_storage_callback=page_storage_callback,
-        window_pause_range=(3.0, 8.0),
+        window_pause_range=(list_window_pause_min, list_window_pause_max),
         page_limit=page_limit_or_none,
     )
 
@@ -1148,13 +1156,22 @@ def _load_checkpoint(stock_code: str) -> set:
         return set()
 
 
-def _save_checkpoint(stock_code: str, done_ids: set):
-    """持久化检查点（追加模式，不丢失已有记录）"""
+def _write_checkpoint(stock_code: str, done_ids: set):
+    """Atomically persist the full Stage 2 checkpoint set."""
     cp = _checkpoint_path(stock_code)
-    existing = _load_checkpoint(stock_code)
+    tmp = _tmp_path(cp)
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump({'done_ids': sorted(done_ids), 'updated_at': datetime.now().isoformat()}, f)
+        f.write('\n')
+    _safe_replace(tmp, cp)
+
+
+def _save_checkpoint(stock_code: str, done_ids: set, existing_done_ids: set = None):
+    """持久化检查点（追加模式，不丢失已有记录）"""
+    existing = set(existing_done_ids) if existing_done_ids is not None else _load_checkpoint(stock_code)
     existing.update(done_ids)
-    with open(cp, 'w', encoding='utf-8') as f:
-        json.dump({'done_ids': list(existing), 'updated_at': datetime.now().isoformat()}, f)
+    _write_checkpoint(stock_code, existing)
+    return existing
 
 
 def _delete_checkpoint(stock_code: str):
@@ -1183,10 +1200,10 @@ def crawl_post_detail_csv(stock_code: str, csv_paths: list, detail_workers: int 
     posts, title_fills = load_posts_for_detail_crawl(csv_paths, skip_failed_ids=failed_ids)
     content_updates = _load_content_delta(stock_code)
 
-    # 先写回普通帖标题填充（无需爬取，直接本地完成）
+    # 普通帖标题填充和财富号正文统一在末尾写回，减少大 CSV 重写次数。
     if title_fills:
-        _flush_updates_to_csv(csv_paths, title_fills)
-        print(f'  ✓ 已本地填充 {len(title_fills)} 条普通帖 content → post_title')
+        content_updates.update(title_fills)
+        print(f'  ✓ 已准备本地填充 {len(title_fills)} 条普通帖 content → post_title')
 
     # 如果断点续爬中有已爬但未合并的 delta，也合并进来
     if content_updates and not posts:
@@ -1227,10 +1244,28 @@ def crawl_post_detail_csv(stock_code: str, csv_paths: list, detail_workers: int 
         print('  ✓ 全部财富号帖子已完成，跳过')
         return True
 
-    CHECKPOINT_INTERVAL = 50
+    CHECKPOINT_INTERVAL = 100
+    DELTA_FLUSH_INTERVAL = 50
     crawl_count = [0]
     batch_done = set()
+    checkpoint_done_ids = set(done_ids)
     cb_lock = threading.Lock()
+    delta_handle = open(_content_delta_path(stock_code), 'a', encoding='utf-8')
+    delta_pending = [0]
+
+    def append_delta_buffered(post_id: str, content: str):
+        if not content:
+            return
+        delta_handle.write(json.dumps({'post_id': str(post_id), 'post_content': content}, ensure_ascii=False))
+        delta_handle.write('\n')
+        delta_pending[0] += 1
+        if delta_pending[0] >= DELTA_FLUSH_INTERVAL:
+            delta_handle.flush()
+            try:
+                os.fsync(delta_handle.fileno())
+            except OSError:
+                pass
+            delta_pending[0] = 0
 
     def update_callback(post_id, update_data):
         pid = str(post_id)
@@ -1238,7 +1273,7 @@ def crawl_post_detail_csv(stock_code: str, csv_paths: list, detail_workers: int 
         with cb_lock:
             if content:
                 content_updates[pid] = content
-                _append_content_delta(stock_code, pid, content)
+                append_delta_buffered(pid, content)
             elif update_data.get('_detail_failed'):
                 _append_detail_failed(
                     stock_code,
@@ -1248,21 +1283,31 @@ def crawl_post_detail_csv(stock_code: str, csv_paths: list, detail_workers: int 
                 )
             crawl_count[0] += 1
             batch_done.add(pid)
+            checkpoint_done_ids.add(pid)
             if crawl_count[0] % CHECKPOINT_INTERVAL == 0:
-                _save_checkpoint(stock_code, batch_done)
+                _write_checkpoint(stock_code, checkpoint_done_ids)
                 batch_done.clear()
 
     post_crawler = PostCrawler(stock_code)
-    ok = post_crawler.crawl_post_detail(
-        posts=posts,
-        update_callback=update_callback,
-        max_workers=detail_workers
-    )
+    try:
+        ok = post_crawler.crawl_post_detail(
+            posts=posts,
+            update_callback=update_callback,
+            max_workers=detail_workers
+        )
+    finally:
+        with cb_lock:
+            delta_handle.flush()
+            try:
+                os.fsync(delta_handle.fileno())
+            except OSError:
+                pass
+            delta_handle.close()
 
     # 最终写回 CSV
     _flush_updates_to_csv(csv_paths, content_updates)
     if batch_done:
-        _save_checkpoint(stock_code, batch_done)
+        _write_checkpoint(stock_code, checkpoint_done_ids)
     if ok is False:
         print('  [pause] caifuhao detail crawl hit retryable blocking; checkpoint kept for next retry')
         return False
@@ -1784,12 +1829,13 @@ def run_stage3_full(start_date: str):
 # ==================== 主入口 ====================
 
 def main():
-    global STOCK_CODE, CRAWL_MODE, START_DATE, LIST_WORKERS, LIST_WINDOW_SIZE, LIST_SOURCE, LIST_PAGE_LIMIT
+    global STOCK_CODE, CRAWL_MODE, START_DATE, LIST_WORKERS, LIST_WINDOW_SIZE
+    global LIST_WINDOW_PAUSE_MIN, LIST_WINDOW_PAUSE_MAX, LIST_SOURCE, LIST_PAGE_LIMIT
     parser = argparse.ArgumentParser(description='000001 自动化数据流水线 (CSV-Native 高速版)')
     parser.add_argument('--stock', default=STOCK_CODE,
                         help='股票代码，默认 000001；可传 1/000001/600000 等格式')
-    parser.add_argument('--stage', type=int, choices=[1, 2, 3], required=True,
-                        help='运行阶段: 1=提取+列表爬取, 2=正文爬取, 3=整合上传清理')
+    parser.add_argument('--stage', choices=['1', '2', '3', 'all'], required=True,
+                        help='运行阶段: 1=提取+列表爬取, 2=正文爬取, 3=整合上传清理, all=单进程顺序执行三阶段')
     parser.add_argument('--crawl-mode', choices=['incremental', 'full'], default='incremental',
                         help='爬取模式: incremental=历史CSV+增量补爬, full=从start_date全量爬取(默认incremental)')
     parser.add_argument('--start-date', default='2009-01-01',
@@ -1798,6 +1844,10 @@ def main():
                         help='兼容参数；当前上游 Selenium HTML 方法按单浏览器顺序翻页')
     parser.add_argument('--list-window-size', type=int, default=80,
                         help='兼容参数；用于 full 模式进度日志')
+    parser.add_argument('--list-window-pause-min', type=float, default=0.3,
+                        help='full Stage 1 successful page-window pause lower bound')
+    parser.add_argument('--list-window-pause-max', type=float, default=1.2,
+                        help='full Stage 1 successful page-window pause upper bound')
     parser.add_argument('--list-source', choices=['html', 'api', 'auto', 'selenium'], default='html',
                         help='full 模式 Stage 1 列表数据源；当前固定使用上游 Selenium HTML 方法，api/auto 会按 html 处理')
     parser.add_argument('--list-page-limit', type=int, default=0,
@@ -1816,19 +1866,46 @@ def main():
     START_DATE = args.start_date
     LIST_WORKERS = args.list_workers
     LIST_WINDOW_SIZE = args.list_window_size
+    LIST_WINDOW_PAUSE_MIN = args.list_window_pause_min
+    LIST_WINDOW_PAUSE_MAX = args.list_window_pause_max
     LIST_SOURCE = args.list_source
     LIST_PAGE_LIMIT = args.list_page_limit
 
-    if args.stage == 1:
+    if args.stage == '1':
         ok = run_stage1(
             source_dirs=args.source_dir,
             force_refresh_base=args.force_refresh_base,
             force_full_refresh=args.force_full_refresh,
         )
-    elif args.stage == 2:
+    elif args.stage == '2':
         ok = run_stage2(detail_workers=args.detail_workers)
-    elif args.stage == 3:
+    elif args.stage == '3':
         ok = run_stage3()
+    else:
+        total_started = time.time()
+        stage_timings = {}
+        stage_started = time.time()
+        ok = run_stage1(
+            source_dirs=args.source_dir,
+            force_refresh_base=args.force_refresh_base,
+            force_full_refresh=args.force_full_refresh,
+        )
+        stage_timings[1] = time.time() - stage_started
+        print(f'[STAGE_TIMING] stage=1 seconds={stage_timings[1]:.2f}')
+        if ok:
+            stage_started = time.time()
+            ok = run_stage2(detail_workers=args.detail_workers)
+            stage_timings[2] = time.time() - stage_started
+            print(f'[STAGE_TIMING] stage=2 seconds={stage_timings[2]:.2f}')
+        if ok:
+            stage_started = time.time()
+            ok = run_stage3()
+            stage_timings[3] = time.time() - stage_started
+            print(f'[STAGE_TIMING] stage=3 seconds={stage_timings[3]:.2f}')
+        for stage_num in (1, 2, 3):
+            if stage_num in stage_timings:
+                print(f'[STAGE_TIMING] stage={stage_num} seconds={stage_timings[stage_num]:.2f}')
+        print(f'[STAGE_TIMING] stage=all seconds={time.time() - total_started:.2f}')
 
     sys.exit(0 if ok else 1)
 

@@ -1,462 +1,319 @@
-# 东方财富股吧全量爬虫 — 问题修复与优化方案
+# 批量爬取性能优化方案
 
-> **分析时间**：2026-06-30  
-> **对比基线**：[股吧爬虫问题分析文档.md](./股吧爬虫问题分析文档.md)（另一电脑运行环境）  
-> **当前代码库**：`e:\guba_project\EastMoney_Crawler\`
+## 已完成的优化
 
----
+以下改进已在当前代码中实现，不需重复处理：
 
-## 问题逐项对照
-
-| # | 问题 | 文档状态 | 当前代码状态 | 说明 |
-|---|------|:------:|:----------:|------|
-| 1 | Windows 文件锁定冲突 | 已修复 | **未修复** | `write_json()` 无重试逻辑，`_safe_replace()` 不存在 |
-| 2 | UnicodeDecodeError | 未修复 | **未修复** | `resp.text` 无多编码容错链 |
-| 3 | Worker 静默退出 | 未修复 | **部分修复** | 已添加超时跳过 + 连续失败退出，但 `find_next_claim()` 仍无重试等待 |
-| 4 | Python stdout 缓冲 | 未修复 | **未修复** | `PYTHONUNBUFFERED` 未设置，`batch_worker.py` 无行缓冲 |
-| 5 | 路径空格解析错误 | 已修复 | **已修复** | `ProgressDir` 已加转义引号 |
-| 6 | 多 Worker 竞争 | 部分缓解 | **部分缓解** | 原子锁 + 3h 过期检查，但过期时间过长 |
-| 7 | Stage 1 失败 | 未定位根因 | **仍存在** | 4 只失败股票无具体错误信息 |
-| 8 | 零磁盘预警 | 低危 | **未修复** | 无趋势预测，仅瞬时检查 |
+- **进度面板** (`watch_batch_progress.ps1`)：显示实时进度、完成耗时、总量限制、失败/阻塞警告
+- **超时自动跳过** (`batch_worker.py`)：`--stock-timeout-minutes` + `--max-consecutive-failures`，连续超时自动退出
+- **deferred 重试**：反爬触发后延迟重试，避免硬冲
+- **UTF-8 编码修复**：面板 JSON 解析已统一使用 `-Encoding UTF8`
 
 ---
 
-## 问题 1：Windows 文件锁定冲突（PermissionError）⚠️ 高危
+## 方案 1：Stage 2 财富号补爬优化
 
-### 当前代码状态
+**优先级：最高。预估节省 10%-25% 总耗时。**
 
-`batch_worker.py` 第 190-196 行：
+改动文件：`crawler.py`、`auto_pipeline_000001.py`
 
-```python
-def write_json(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-    os.replace(tmp_path, path)
-```
+### 1.1 浏览器 Cookie 预热改为 lazy
 
-**问题**：`os.replace` 在 Windows 上遇到文件被其他进程（反病毒软件、Windows 索引、另一个 Worker）持有时会直接抛出 `PermissionError`，无重试。
+**当前问题**（`crawler.py:652`）：每只股票进入财富号补爬时，无条件调用 `_bootstrap_caifuhao_session_via_browser()` 启动 Chrome，固定 sleep(3)+sleep(2)，即使代码已注释"浏览器预热失败不致命，WAP API 仍可工作"。
 
-`auto_pipeline_000001.py` 中 `_safe_replace()` 函数在当前代码中**不存在**。
+**改进方案**：
 
-### 触发场景
-- 多 Worker 同时写入同一股票进度文件（`.failed`、`.retrying`）
-- Stage 3 合并 CSV 时 `shutil.move` 与反病毒软件冲突
-- Worker 崩溃后残留文件句柄未释放
-
-### 优化方案
-
-**1.1 `write_json()` 加重试（P0）**
+不提前预热，仅在以下条件触发时才启动浏览器获取 Cookie：
+- WAP API 连续出现 `http_403` / `http_429` / `blocked_validation`
+- 窗口内 retryable 失败率 > 10%
 
 ```python
-def write_json(path: Path, payload: dict, max_retries: int = 5) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-    for attempt in range(1, max_retries + 1):
-        try:
-            os.replace(tmp_path, path)
-            return
-        except (PermissionError, FileNotFoundError) as e:
-            if attempt == max_retries:
-                raise
-            delay = 0.5 * attempt
-            print(f"[write_json] retry {attempt}/{max_retries} after {delay}s: {e}")
-            time.sleep(delay)
-```
+master_cookies = []
+_lazy_warmed = False
 
-**1.2 临时文件名加 PID 后缀（P1）**
-
-```python
-tmp_path = path.with_suffix(f".tmp.{os.getpid()}")
-```
-
-避免多 Worker 写入同名临时文件互相覆盖。
-
-**1.3 `auto_pipeline_000001.py` 新增 `_safe_replace()`（P1）**
-
-```python
-def _safe_replace(src: str, dst: str, max_retries: int = 5) -> None:
-    """原子替换文件，Windows 下处理 PermissionError 重试。"""
-    for attempt in range(1, max_retries + 1):
-        try:
-            os.replace(src, dst)
-            return
-        except PermissionError:
-            if attempt == max_retries:
-                raise
-            time.sleep(0.5 * attempt)
-```
-
-并将所有 `os.replace()` / `shutil.move()` 调用替换为 `_safe_replace()`。
-
----
-
-## 问题 2：UnicodeDecodeError — 财富号返回非 UTF-8 数据 ⚠️ 中危
-
-### 当前代码状态
-
-`parser.py` 第 452 行（`_try_requests_caifuhao`）：
-
-```python
-text = resp.text or ''
-```
-
-`parser.py` 第 312、349 行（`_try_wap_caifuhao`）：
-
-```python
-brief_data = self._parse_json_or_jsonp(brief_resp.text)
-data = self._parse_json_or_jsonp(resp.text)
-```
-
-**问题**：`resp.text` 在 requests 库中通常不会抛 `UnicodeDecodeError`（requests 内部用 chardet 检测编码并 fallback 到 ISO-8859-1）。但 `curl_cffi` 库的 `resp.text` 行为可能不同，且 `resp.content` 直接 decode 时无容错。
-
-### 触发场景
-- 财富号返回 gzip 压缩异常的二进制数据
-- 反爬页面返回非 UTF-8 编码内容（如 GBK）
-- `curl_cffi` 的 response 对象与标准 requests 行为不一致
-
-### 优化方案
-
-**2.1 `_try_requests_caifuhao` 增加编码容错链（P1）**
-
-```python
-# 替换 line 452: text = resp.text or ''
-try:
-    text = resp.text or ''
-except (UnicodeDecodeError, LookupError):
+def _warm_cookie_if_needed(reason: str):
+    nonlocal _lazy_warmed, master_cookies
+    if _lazy_warmed:
+        return
+    _lazy_warmed = True
     try:
-        text = resp.content.decode('utf-8', errors='replace')
-    except Exception:
-        try:
-            text = resp.content.decode('gbk', errors='replace')
-        except Exception:
-            text = resp.content.decode('latin-1', errors='replace')
+        self._bootstrap_caifuhao_session_via_browser()
+        master_cookies = list(self._caifuhao_session.cookies) if self._caifuhao_session else []
+    except Exception as e:
+        print(f'{self.symbol}: [CAIFUHAO] lazy warmup failed ({reason}): {e}')
 ```
 
-**2.2 `_try_wap_caifuhao` JSON 解析容错（P1）**
+**收益**：每只股票减少 ~5s 的 Chrome 启动开销，5500 只 ≈ 7.6 小时。
+
+### 1.2 请求节流改为自适应（简化版）
+
+**当前问题**（`crawler.py:642-647`）：节流参数固定写死：
 
 ```python
-# 替换 line 312: brief_data = self._parse_json_or_jsonp(brief_resp.text)
-try:
-    raw_text = brief_resp.text
-except (UnicodeDecodeError, LookupError):
-    raw_text = brief_resp.content.decode('utf-8', errors='replace')
-brief_data = self._parse_json_or_jsonp(raw_text)
+WINDOW_PAUSE = (2.0, 5.0)
+PER_REQ_DELAY = (0.1, 0.4)
 ```
 
-同样处理 line 349 的 `resp.text`。
+无论服务器是否正常响应，每 50 条都暂停 2-5 秒。
+
+**改进方案**：单档自适应，不需要 fast/balanced/conservative 三档。核心逻辑：
+
+```python
+# 初始激进值
+PER_REQ_DELAY = (0.05, 0.15)
+WINDOW_PAUSE = (0.3, 1.0)
+
+# 在窗口结束时根据失败率调整
+fail_rate = window_failed / max(len(window), 1)
+if window_blocked:
+    pause = random.uniform(30, 60)          # 硬封禁，长冷却
+    PER_REQ_DELAY = (1.0, 3.0)              # 大幅降速
+elif fail_rate >= 0.05:
+    pause = random.uniform(3.0, 8.0)        # 高失败率，切保守
+elif fail_rate > 0:
+    pause = random.uniform(1.0, 3.0)        # 偶发失败，温和降速
+else:
+    pause = random.uniform(0.2, 0.8)        # 零失败，极速
+    PER_REQ_DELAY = (0.03, 0.10)            # 进一步加速
+```
+
+新增 `--caifuhao-conservative` 开关，在夜间或已被封时锁定保守参数，日常默认自适应。
+
+**收益**：财富号多的股票 Stage 2 耗时降低 15%-35%。
+
+### 1.3 delta 和 checkpoint 改成批量写
+
+**当前问题**：
+
+- `_append_content_delta`（`auto_pipeline_000001.py:1072`）每条正文都 open/write/close，Windows 下开销大
+- `_save_checkpoint`（`auto_pipeline_000001.py:1151`）每 50 条重新 `_load_checkpoint` → 合并 → 全量重写 JSON
+
+**改进方案**：
+
+delta 文件持有句柄，批量 flush：
+
+```python
+delta_f = open(delta_path, 'a', encoding='utf-8')
+_pending = [0]
+
+def _append_buffered(post_id, content):
+    delta_f.write(json.dumps({'post_id': str(post_id), 'post_content': content}, ensure_ascii=False) + '\n')
+    _pending[0] += 1
+    if _pending[0] >= 50:
+        delta_f.flush(); os.fsync(delta_f.fileno()); _pending[0] = 0
+```
+
+checkpoint 改内存维护，每 200 条原子写一次（不再每次读旧文件）。
+
+**收益**：Windows 下减少大量小文件 open/close，Stage 2 更平滑。
+
+### 1.4 普通帖标题填充与财富号正文合并一次 CSV 重写
+
+**当前问题**（`auto_pipeline_000001.py:1188-1263`）：先 `_flush_updates_to_csv` 写 title_fills，财富号补爬结束再写 content_updates，对大 CSV 是两次全量读写。
+
+**改进方案**：
+
+1. title_fills 不立即 flush，合并进 content_updates
+2. 财富号补爬结束后统一 flush 一次
+3. 中途如果累积更新 > 5000 条或 Stage 2 已运行 > 10min，做一次中间 flush
+
+**收益**：大多数股票只重写一次 full CSV，大股票（20MB+）明显减 I/O。
 
 ---
 
-## 问题 3：Worker 静默退出（无自动恢复）⚠️ 高危
+## 方案 2：Stage 1 列表页全量抓取优化
 
-### 当前代码状态
+**优先级：最高。预估节省 10%-20% 总耗时。**
 
-`batch_worker.py` 第 843-859 行：
+改动文件：`auto_pipeline_000001.py`、`crawler.py`
 
-```python
-def find_next_claim(stocks, args) -> ClaimedStock | None:
-    stale_seconds = args.stale_lock_hours * 3600
-    for stock, source_csv in stocks.items():
-        claim = claim_stock(stock, source_csv, ...)
-        if claim is not None:
-            return claim
-    return None  # 无等待，立即返回 None
-```
+### 2.1 窗口暂停改为失败率驱动
 
-**问题**：当只剩 1 个 Worker 且所有「下一个」股票都有锁文件（来自已死 Worker 的残留锁）时，`find_next_claim` 立即返回 None，Worker 退出。3 小时 stale 过期时间内，系统完全停滞。
+**当前问题**（`auto_pipeline_000001.py:897`）：`window_pause_range=(3.0, 8.0)` 固定值，即使窗口内 0 失败也暂停 3-8 秒。大股票 300-800 页时这个累计开销可达几十到上百秒。
 
-**本次会话已添加的修复**：
-- 单股超时自动跳过（`--stock-timeout-minutes`）
-- 连续失败自动退出（`--max-consecutive-failures`）
-
-**仍缺失**：
-- `find_next_claim` 无重试等待机制
-- 无外部进程守护/监控
-
-### 优化方案
-
-**3.1 `find_next_claim` 增加等待重试（P0）**
+**改进方案**（同 1.2 的自适应逻辑，复用到 Stage 1）：
 
 ```python
-def find_next_claim(
-    stocks: dict[str, Path | None],
-    args: argparse.Namespace,
-    max_wait_seconds: float = 120.0,
-) -> ClaimedStock | None:
-    stale_seconds = args.stale_lock_hours * 3600
-    start = time.time()
-    while True:
-        for stock, source_csv in stocks.items():
-            claim = claim_stock(
-                stock, source_csv, args.progress_dir,
-                args.worker_id, stale_seconds=stale_seconds,
-                retry_failed=args.retry_failed,
-            )
-            if claim is not None:
-                return claim
-        elapsed = time.time() - start
-        if elapsed >= max_wait_seconds:
-            print(f"[{args.worker_id}] no pending stock after {elapsed:.0f}s wait")
-            return None
-        print(f"[{args.worker_id}] all stocks locked/busy, retrying in 30s...")
-        time.sleep(30)
+if window_blocked:
+    pause = random.uniform(30, 60)
+elif fail_rate >= 0.05:
+    pause = random.uniform(3.0, 8.0)
+elif fail_rate > 0:
+    pause = random.uniform(1.0, 3.0)
+else:
+    pause = random.uniform(0.2, 0.8)
 ```
 
-**3.2 缩短 stale lock 默认值（P0）**
+### 2.2 暴露列表页参数到命令行
 
-`batch_worker.py` 第 937 行：`stale_lock_hours` 默认值从 `3.0` 改为 `1.0`。
+当前 `LIST_WINDOW_SIZE` 已暴露到 `batch_worker.py`。补充暴露暂停范围：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--list-window-pause-min` | 0.3 | 无失败时最小暂停 (秒) |
+| `--list-window-pause-max` | 1.2 | 无失败时最大暂停 (秒) |
+| `--list-window-size` | 120 | 每个窗口的页数 |
+
+### 2.3 小股票自动减少并发
+
+boundary_page 很小时不需要高并发：
 
 ```python
-parser.add_argument("--stale-lock-hours", type=float, default=1.0,
-                    help="Hours before a lock file is considered stale")
-```
-
-`batch_launcher.ps1` 第 7 行同步修改：
-
-```powershell
-[double]$StaleLockHours = 1,
-```
-
-**3.3 外部守护脚本（P1）**
-
-创建一个简单的 PowerShell 守护脚本，每 5 分钟检查 Python 进程数，为 0 则自动重启 launcher：
-
-```powershell
-# daemon.ps1
-param([int]$CheckSeconds = 300)
-while ($true) {
-    $pyCount = (Get-Process python -ErrorAction SilentlyContinue).Count
-    if ($pyCount -eq 0) {
-        Write-Host "$(Get-Date) No Python processes, restarting launcher..."
-        .\batch_launcher.ps1 -WorkerCount 3 -CrawlMode full -StartDate 2009-01-01 -ListSource html
-    }
-    Start-Sleep -Seconds $CheckSeconds
-}
-```
-
----
-
-## 问题 4：Python stdout 缓冲导致日志不可见 ⚠️ 中危
-
-### 当前代码状态
-
-`batch_launcher.ps1` 第 30-31 行：
-
-```powershell
-$env:PYTHONIOENCODING = "utf-8"
-$env:PYTHONUTF8 = "1"
-```
-
-**缺失**：`$env:PYTHONUNBUFFERED = "1"` 未设置。
-
-`batch_worker.py`：无 `sys.stdout.reconfigure(line_buffering=True)`。
-
-`auto_pipeline_000001.py` 第 36-39 行：
-
-```python
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-```
-
-**缺失**：未设置 `line_buffering=True`。
-
-### 影响
-- `batch_logs/worker_*.out.log` 长期为空或 8KB 块写入
-- 无法判断 Worker 是卡死还是正常跑
-- 本次会话中多次误判 Worker 已退出
-
-### 优化方案（5 分钟修复）
-
-**4.1 `batch_launcher.ps1` 设置环境变量（P0）**
-
-```powershell
-$env:PYTHONUNBUFFERED = "1"    # 新增
-$env:PYTHONIOENCODING = "utf-8"
-$env:PYTHONUTF8 = "1"
-```
-
-**4.2 `batch_worker.py` 开头添加行缓冲（P0）**
-
-```python
-# 在 imports 之后、main 之前
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
-```
-
-**4.3 `auto_pipeline_000001.py` 已有 reconfigure 处增加 `line_buffering`（P0）**
-
-```python
-sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
-sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+if boundary_page <= 20:
+    effective_workers = min(list_workers, 2)
+elif boundary_page <= 80:
+    effective_workers = min(list_workers, 4)
+else:
+    effective_workers = list_workers
 ```
 
 ---
 
-## 问题 5：路径空格解析错误
+## 方案 3：三 Stage 合并为单进程
 
-**已修复**，无需处理。
+**优先级：高。预估节省 5-15s/只。**
+
+改动文件：`auto_pipeline_000001.py`、`batch_worker.py`
+
+**当前问题**：每只股票启动 3 个子进程（stage 1 → stage 2 → stage 3），每次重新 import pandas/selenium/requests。5500 只 ≈ 16500 次进程启动。
+
+**改进方案**：
+
+**第一步**：`auto_pipeline_000001.py` 新增 `--stage all`，单次进程内串行执行三个阶段。保留 `.pipeline_flags` 机制，每个 stage 成功后仍写 flag。
+
+```python
+if args.stage == 'all':
+    ok = run_stage1(...)
+    if ok: ok = run_stage2(...)
+    if ok: ok = run_stage3(...)
+    sys.exit(0 if ok else 1)
+```
+
+**第二步**（更优，后续迭代）：`batch_worker.run_stock_pipeline` 直接 import `auto_pipeline_000001` 的函数并调用，完全消除子进程开销。当前先以 `--stage all` 子进程方式验证稳定性。
 
 ---
 
-## 问题 6：多 Worker 竞争同一股票 ⚠️ 中危
+## 方案 4：Stage 3 流式校验直写 data 目录
 
-### 当前代码状态
+**优先级：中。预估节省 0%-2% 总耗时，主要减少磁盘压力。**
 
-`claim_stock()` 使用 `os.O_CREAT | os.O_EXCL` 实现原子文件锁，设计正确。但：
+改动文件：`auto_pipeline_000001.py`
 
-- **stale lock 过期时间**：默认 3 小时（`batch_worker.py` line 937），过长
-- **无 worker_id 交叉校验**：写入 `.done`/`.failed` 时不检查是否由当前 Worker 持有锁
+**当前问题**：Stage 3 先全量读入 `all_rows` → 排序 → 写 `temp_export/` → copy 到 `data/`。Stage 1 已按 `post_publish_time` 降序写出，Stage 2 不改变行顺序，所以排序通常是冗余的。
 
-### 优化方案
+**改进方案**：
 
-**6.1 缩短 stale lock 默认值（P0）** — 同问题 3.2
-
-**6.2 `write_json` 写入前校验 worker_id（P1）**
-
-```python
-def mark_state(progress_dir, stock, suffix, payload):
-    lock_path = state_path(progress_dir, stock, ".lock")
-    # 如果锁不存在或 worker_id 不匹配，说明被其他 Worker 抢占
-    if lock_path.exists():
-        try:
-            lock_data = json.loads(lock_path.read_text(encoding="utf-8"))
-            if lock_data.get("worker_id") != payload.get("worker_id"):
-                print(f"[{payload.get('worker_id')}] lock stolen by {lock_data.get('worker_id')}, skipping write")
-                return
-        except Exception:
-            pass
-    write_json(state_path(progress_dir, stock, suffix), payload)
-```
+1. 只检查是否单调递减；乱序时回退到当前排序逻辑
+2. 输出直接写 `data/{stock}_full_20090101.csv.tmp`，校验通过后 `os.replace`
+3. 取消 `temp_export` 中间目录
 
 ---
 
-## 问题 7：Stage 1 失败 — 4 只股票全部 3 次重试失败 ⚠️ 中危
+## 方案 5：Worker 任务领取游标化
 
-### 当前代码状态
+**优先级：中。减少 5000+ 大列表的文件扫描开销。**
 
-失败股票的错误信息仅记录为 `stage1_exit_1`，stderr 被 `Start-Process` 吞掉，无法定位根因。
+改动文件：`batch_worker.py`
 
-### 优化方案
+**当前问题**：每个 worker 领取下一只股票都从 `stocks.items()` 开头扫描，后期 `.done` 越多越浪费。
 
-**7.1 stderr 合并到 stdout（P0）**
-
-`batch_worker.py` 第 508-516 行已设置 `stderr=subprocess.STDOUT`，但还需确保 `auto_pipeline_000001.py` 内部异常被打印到 stdout。
-
-**7.2 失败时输出完整错误信息（P0）**
-
-在 `classify_stage_failure()` 中增加更多错误分类：
+**改进方案**：
 
 ```python
-def classify_stage_failure(stage: int, result: StageResult) -> str:
-    tail = result.output_tail
-    if result.returncode == -1 and "TIMEOUT" in tail:
-        return f"stage{stage}_timeout"
-    if "验证" in tail or "validate" in tail.lower() or "blocked" in tail.lower():
-        return f"stage{stage}_blocked"
-    if "ConnectionError" in tail or "Timeout" in tail or "timeout" in tail.lower():
-        return f"stage{stage}_network"
-    if "MemoryError" in tail or "disk" in tail.lower():
-        return f"stage{stage}_resource"
-    if stage == 3 and ("上传失败" in tail or "upload" in tail.lower()):
-        return "upload_failed"
-    return f"stage{stage}_exit_{result.returncode}"
-```
+stock_items = list(stocks.items())
+cursor = abs(hash(worker_id)) % len(stock_items)  # 各 worker 错开起点
 
-**7.3 失败股票自动回退 Selenium 路线（P2）**
-
-对连续失败 2 次的股票，自动尝试 `--list-source selenium`。
-
----
-
-## 问题 8：零磁盘预警机制 ⚠️ 低危
-
-### 当前代码状态
-
-`batch_worker.py` 第 881-888 行：
-
-```python
-free_gb = disk_free_gb(PROJECT_DIR)
-if free_gb < args.min_free_gb:
-    print(f"disk free {free_gb:.2f}GB < {args.min_free_gb:.2f}GB; waiting...")
-    time.sleep(args.disk_wait_seconds)
-    continue
-```
-
-**缺失**：无趋势预测，无 Stage 1 启动前空间估算。
-
-### 优化方案
-
-**8.1 趋势预测（P2）**
-
-```python
-def estimate_stock_space(stock: str, crawl_mode: str) -> float:
-    """根据已完成股票的平均大小估算新股票所需空间（GB）"""
-    data_dir = DEFAULT_DATA_DIR
-    if not data_dir.exists():
-        return 0.5  # 默认估算 0.5 GB
-    csv_files = list(data_dir.glob("*_full_*.csv"))
-    if not csv_files:
-        return 0.5
-    avg_size = sum(f.stat().st_size for f in csv_files) / len(csv_files)
-    return avg_size / (1024 ** 3) * 2  # 2x 安全系数
-```
-
-在 `process_claim` 中调用：
-
-```python
-estimated = estimate_stock_space(claim.stock, args.crawl_mode)
-free_gb = disk_free_gb(PROJECT_DIR)
-if free_gb < estimated * 2:
-    print(f"[{args.worker_id}] insufficient disk: {free_gb:.1f}GB free, need ~{estimated:.1f}GB, waiting...")
-    time.sleep(args.disk_wait_seconds)
-    return False
+for offset in range(len(stock_items)):
+    idx = (cursor + offset) % len(stock_items)
+    stock, source_csv = stock_items[idx]
+    claimed = claim_stock(stock, ...)
+    if claimed:
+        cursor = (idx + 1) % len(stock_items)  # 下次从下一个继续
+        return claimed
 ```
 
 ---
 
-## 优先级排序
+## 方案 6：轻量吞吐监控
 
-| 优先级 | 问题 | 修复项 | 工作量 |
-|:------:|------|--------|:------:|
-| **P0** | 4 | stdout 行缓冲（`PYTHONUNBUFFERED` + `line_buffering`） | 5 min |
-| **P0** | 1 | `write_json()` 加重试逻辑 | 15 min |
-| **P0** | 3 | `find_next_claim()` 等待重试 + stale lock 缩短至 1h | 20 min |
-| **P0** | 7 | `classify_stage_failure` 增加错误分类 | 10 min |
-| **P1** | 2 | 财富号编码容错链 | 15 min |
-| **P1** | 1 | `auto_pipeline_000001.py` 新增 `_safe_replace()` | 20 min |
-| **P1** | 6 | `mark_state` 写入前校验 worker_id | 15 min |
-| **P1** | 3 | 外部守护脚本 `daemon.ps1` | 15 min |
-| **P2** | 8 | 磁盘趋势预测 | 30 min |
-| **P2** | 7 | 失败自动回退 Selenium 路线 | 2 h |
+**优先级：低。帮助判断是否需要调参。**
+
+改动：`watch_batch_progress.ps1` 或新增一个小脚本。
+
+不搞复杂的推荐引擎。只需读取最近 N 个 `.summary.json` 输出：
+
+```
+已完成: 150  剩余: 5400
+最近10只: 平均 5.2min/只  (Stage1:2.3min  Stage2:2.7min  Stage3:0.2min)
+吞吐: ~11.5只/小时  (当前 2 worker)
+估算: 约 470小时 → 需加速
+建议: WorkerCount 从 2 → 4 (~23只/小时, 约235小时)
+```
+
+核心规则只有两条：
+- 若最近 20 只成功率 ≥ 95% 且无 blocked → 可加 worker
+- 若出现 blocked/deferred 增加 → 降 worker 或等冷却
 
 ---
 
-## 建议执行顺序
+## 落地顺序
 
-```
-第一轮（30 min，P0 全部修复）：
-  1. stdout 行缓冲（问题 4）
-  2. write_json 重试（问题 1）
-  3. find_next_claim 等待重试 + stale lock 1h（问题 3）
-  4. classify_stage_failure 增强（问题 7）
+### 第 1 步：Stage 2 固定开销优化（预计影响最大）
 
-第二轮（1 h，P1 修复）：
-  5. 财富号编码容错（问题 2）
-  6. _safe_replace 封装（问题 1）
-  7. mark_state worker_id 校验（问题 6）
-  8. 守护脚本 daemon.ps1（问题 3）
+- 1.1 lazy browser warmup
+- 1.3 delta/checkpoint 批量写
+- 1.4 CSV 重写合并
 
-第三轮（按需，P2 修复）：
-  9. 磁盘趋势预测（问题 8）
-  10. 失败自动回退 Selenium（问题 7）
-```
+验证：`.\batch_launcher.ps1 -WorkerCount 1 -Limit 10 -NoWatch`，对比 summary 中 Stage 2 耗时。
+
+### 第 2 步：Stage 1 + Stage 2 自适应节流
+
+- 1.2 财富号自适应节流
+- 2.1 列表页失败率驱动暂停
+- 2.3 小股票减少并发
+
+验证：`.\batch_launcher.ps1 -WorkerCount 2 -Limit 20 -NoWatch`，确认 blocked 不增加。
+
+### 第 3 步：单进程模式
+
+先实现 `--stage all`，`batch_worker` 新增 `--single-process-stock` 开关（默认关）。
+
+验证：`python batch_worker.py --worker-id test --crawl-mode full --stock-list .\数据_list.csv --limit 5 --single-process-stock`
+
+### 第 4 步：参数暴露 + 游标 + 监控
+
+- 2.2 暴露列表页暂停参数
+- 方案 5 worker 游标
+- 方案 6 吞吐监控
+
+### 第 5 步：逐步提并发
+
+| 档位 | WorkerCount | 说明 |
+|------|-------------|------|
+| 稳定 | 2-3 | 夜间/无人值守 |
+| 标准 | 4-5 | 日常白天 |
+| 加速 | 6 | 白天有人监控、无 blocked |
+| 冲刺 | 7-8 | 仅在确认稳定时短期使用 |
+
+原则：`WorkerCount × ListWorkers` ≤ 30，`WorkerCount × DetailWorkers` ≤ 30。
+
+---
+
+## 预计效果
+
+组合优化后：
+- 当前基线：~6-7 min/只
+- 优化后预期：4-5 min/只
+- 4 worker：~48-60 只/小时，5500 只约 92-115 小时
+- 6 worker：~72-90 只/小时，5500 只约 61-76 小时
+
+按每天 10 小时运行，6 worker 约 6-8 天可完成全量。
+
+---
+
+## 不建议的优化方向
+
+- **WorkerCount > 10**：容易触发反爬，Chrome/磁盘/网络一起抖动
+- **引入代理池**：增加失败面，先确认 IP 确实被限流再考虑
+- **Selenium 回退为主路径**：稳定但太慢，仅保留作 fallback
+- **引入新数据库**：当前 CSV-native 工作正常，瓶颈不在存储层

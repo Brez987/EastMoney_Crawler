@@ -2,6 +2,8 @@ param(
     [int]$WorkerCount = 3,
     [int]$DetailWorkers = 3,
     [int]$ListWorkers = 6,
+    [double]$ListWindowPauseMin = 0.3,
+    [double]$ListWindowPauseMax = 1.2,
     [int]$ListPageLimit = 0,
     [int]$MaxRetries = 2,
     [double]$StaleLockHours = 1,
@@ -19,6 +21,7 @@ param(
     [int]$MaxConsecutiveFailures = 5,
     [switch]$DryRun,
     [switch]$RetryFailed,
+    [switch]$SingleProcessStock,
     [switch]$Visible,
     [switch]$NoWatch
 )
@@ -110,6 +113,7 @@ Write-Host "Workers:       $WorkerCount"
 Write-Host "Detail workers per stock: $DetailWorkers"
 if ($CrawlMode -eq "full") {
     Write-Host "List workers per stock:   $ListWorkers"
+    Write-Host "List window pause: $ListWindowPauseMin-$ListWindowPauseMax sec"
     Write-Host "List source:    $ListSource"
     if ($ListSource -in @("api", "auto")) {
         Write-Host "  (api/auto uses fast requests HTML path)" -ForegroundColor DarkGray
@@ -152,6 +156,8 @@ for ($i = 1; $i -le $WorkerCount; $i++) {
         "--worker-id", $workerId,
         "--crawl-mode", $CrawlMode,
         "--detail-workers", "$DetailWorkers",
+        "--list-window-pause-min", "$ListWindowPauseMin",
+        "--list-window-pause-max", "$ListWindowPauseMax",
         "--max-retries", "$MaxRetries",
         "--stale-lock-hours", "$StaleLockHours",
         "--min-free-gb", "$MinFreeGb",
@@ -190,6 +196,9 @@ for ($i = 1; $i -le $WorkerCount; $i++) {
     }
     if ($RetryFailed) {
         $workerArgs += "--retry-failed"
+    }
+    if ($SingleProcessStock) {
+        $workerArgs += "--single-process-stock"
     }
 
     $startArgs = @{
@@ -238,6 +247,9 @@ if ($Watch) {
         )
         if ($stockListArg) {
             $watchArgs += @("-StockListFile", "`"$stockListArg`"")
+        }
+        if ($Limit -gt 0) {
+            $watchArgs += @("-Limit", "$Limit")
         }
         $watchProcess = Start-Process -FilePath "powershell.exe" -ArgumentList $watchArgs -PassThru -WindowStyle Normal
         Write-Host "Progress window started pid=$($watchProcess.Id)" -ForegroundColor Green
